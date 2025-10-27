@@ -1,0 +1,6 @@
+,0
+timestamp,2025-10-26T18:56:32
+assets_dir,C:\Users\Cyrus\PycharmProjects\OpsinActivationGUI\assets
+led_csv,C:\Users\Cyrus\PycharmProjects\OpsinActivationGUI\assets\LED_spectra.csv
+powermeter_csv,C:\Users\Cyrus\PycharmProjects\OpsinActivationGUI\assets\powermeter.csv
+output_dir,C:\Users\Cyrus\PycharmProjects\OpsinActivationGUI\opsinlab\outputs

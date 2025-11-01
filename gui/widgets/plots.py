@@ -1,6 +1,7 @@
 import numpy as np
 from PyQt6 import QtWidgets, QtCore
-from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+# IMPORTANT: with PyQt6 use the QtAgg backend, not qt5agg
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 from matplotlib.colorbar import ColorbarBase
 from matplotlib import cm
@@ -17,40 +18,12 @@ OPSIN_COLORS = {
     "UVS": "purple",    # mouse UV-sensitive
 }
 
-
-def _photon_flux_totals(photon_flux_df, leds, col_suffix="_PhotonFlux"):
-    """
-    Integrate per-λ photon flux (photons/s/µm²/nm) over wavelength (nm)
-    to get total photons/s/µm² for each LED, plus a Sum.
-    """
-    if photon_flux_df is None or photon_flux_df.empty:
-        return {led: float("nan") for led in leds} | {"Sum": float("nan")}
-    wl = photon_flux_df["Wavelength"].to_numpy(float)  # nm
-    totals = {}
-    for led in leds:
-        col = f"{led}{col_suffix}"
-        if col in photon_flux_df.columns:
-            phi = photon_flux_df[col].to_numpy(float)
-            totals[led] = float(np.trapezoid(phi, wl))  # photons/s/µm²
-    # Sum of finite entries
-    totals["Sum"] = float(sum(v for v in totals.values() if np.isfinite(v)))
-    return totals
-
-
+# ---------- helpers ----------
 def _ordered_leds(leds):
     """Return LEDs ordered longest → shortest wavelength."""
     return sorted(leds, key=lambda L: LED_WAVELENGTHS.get(L, 0), reverse=True)
 
-
 def _led_set_code(leds_sorted):
-    """
-    Map an ordered LED set to a compact code for the vector label.
-    Examples:
-      ['Red','Green','Blue'] -> 'RGB'
-      ['Red','Green','UV']   -> 'RGUV'
-      ['Green','Blue','UV']  -> 'GBUV'
-      otherwise join first letters ('R','G','B','U' for UV)
-    """
     key = tuple(leds_sorted)
     if key == ("Red", "Green", "Blue"):
         return "RGB"
@@ -58,11 +31,39 @@ def _led_set_code(leds_sorted):
         return "RGUV"
     if key == ("Green", "Blue", "UV"):
         return "GBUV"
-    # Fallback: compose a code from initials
-    def init(L):
-        return "U" if L == "UV" else L[0]
+    def init(L): return "U" if L == "UV" else L[0]
     return "".join(init(L) for L in leds_sorted)
 
+def _find_flux_column(photon_flux_df, led):
+    """
+    Return the column name for a given LED, accepting either '*_PhotonFlux' or bare LED.
+    Returns None if not present.
+    """
+    cand1 = f"{led}_PhotonFlux"
+    if cand1 in photon_flux_df.columns:
+        return cand1
+    if led in photon_flux_df.columns:
+        return led
+    return None
+
+def _photon_flux_totals(photon_flux_df, leds):
+    """
+    Integrate per-λ photon flux (photons/s/µm²/nm) over wavelength (nm)
+    to get total photons/s/µm² for each LED, plus a Sum.
+    Robust to either '*_PhotonFlux' or bare LED columns.
+    """
+    if photon_flux_df is None or photon_flux_df.empty:
+        return {led: float("nan") for led in leds} | {"Sum": float("nan")}
+    wl = photon_flux_df["Wavelength"].to_numpy(float)  # nm
+    totals = {}
+    for led in leds:
+        col = _find_flux_column(photon_flux_df, led)
+        if col is None:
+            continue
+        phi = photon_flux_df[col].to_numpy(float)
+        totals[led] = float(np.trapezoid(phi, wl))  # photons/s/µm²
+    totals["Sum"] = float(sum(v for v in totals.values() if np.isfinite(v)))
+    return totals
 
 # ---------- Base matplotlib tab ----------
 class _MplTab(QtWidgets.QWidget):
@@ -77,7 +78,6 @@ class _MplTab(QtWidgets.QWidget):
             lay.addWidget(lbl)
         lay.addWidget(self.canvas)
 
-
 # ---------- Photon Flux tab with totals strip ----------
 class _PhotonFluxTab(QtWidgets.QWidget):
     """
@@ -89,15 +89,51 @@ class _PhotonFluxTab(QtWidgets.QWidget):
         self.ax = self.fig.add_subplot(111)
         self.canvas = FigureCanvas(self.fig)
 
-        # stats strip (per-LED + Sum)
-        self.stats = QtWidgets.QLabel("")
-        self.stats.setTextFormat(QtCore.Qt.TextFormat.RichText)
-
         lay = QtWidgets.QVBoxLayout(self)
         if title:
             lay.addWidget(QtWidgets.QLabel(f"<b>{title}</b>"))
         lay.addWidget(self.canvas)
+
+        # stats strip (per-LED + Sum)
+        self.stats = QtWidgets.QLabel("")
+        self.stats.setTextFormat(QtCore.Qt.TextFormat.RichText)
         lay.addWidget(self.stats)
+
+        # one-line R* summary (from opsin_weighted_isomerizations)
+        self.iso_stats = QtWidgets.QLabel("")
+        self.iso_stats.setTextFormat(QtCore.Qt.TextFormat.RichText)
+        lay.addWidget(self.iso_stats)
+
+    def set_isom_summary(self, iso_dict: dict | None):
+        """
+        Show opsin-weighted R*/s totals. Accepts the dict with 'Rstar_per_opsin'.
+        Also supports a legacy 'Rstar' envelope if present.
+        """
+        if not iso_dict:
+            self.iso_stats.setText("")
+            return
+
+        vals = iso_dict.get("Rstar_per_opsin")
+        if isinstance(vals, dict) and vals:
+            bits = [f"<b>{k} R*/s:</b> {vals[k]:.3e}" for k in sorted(vals)]
+            self.iso_stats.setText(" &nbsp; | &nbsp; ".join(bits))
+            return
+
+        # Legacy structure fallback
+        env = iso_dict.get("Rstar", {})
+        if isinstance(env, dict) and env:
+            bits = []
+            rod_sum = env.get("Rod", {}).get("Sum", None)
+            if isinstance(rod_sum, (int, float)):
+                bits.append(f"<b>R*/rod/s:</b> {rod_sum:.3e}")
+            for cone_key, payload in (env.get("Cone") or {}).items():
+                s = payload.get("Sum", None)
+                if isinstance(s, (int, float)):
+                    bits.append(f"<b>R*/{cone_key} cone/s:</b> {s:.3e}")
+            self.iso_stats.setText(" &nbsp; | &nbsp; ".join(bits))
+            return
+
+        self.iso_stats.setText("")
 
     def update_plot(self, photon_flux_df, leds):
         ax = self.ax
@@ -112,11 +148,14 @@ class _PhotonFluxTab(QtWidgets.QWidget):
             return
 
         wl = photon_flux_df["Wavelength"].to_numpy(float)
+
+        # Plot each selected LED using whichever column is present
         for led in _ordered_leds(leds):
-            col = f"{led}_PhotonFlux"
-            if col in photon_flux_df.columns:
-                y = photon_flux_df[col].to_numpy(float)
-                ax.plot(wl, y, label=led, color=LED_COLORS.get(led, None), linewidth=2)
+            col = _find_flux_column(photon_flux_df, led)
+            if col is None:
+                continue
+            y = photon_flux_df[col].to_numpy(float)
+            ax.plot(wl, y, label=led, color=LED_COLORS.get(led, None), linewidth=2)
 
         ax.set_xlabel("Wavelength (nm)")
         ax.set_ylabel("Photons / s / µm² / nm")
@@ -140,7 +179,6 @@ class _PhotonFluxTab(QtWidgets.QWidget):
         bits.append(f"<b>Sum: {fmt(totals_dict.get('Sum'))}</b>")
         self.stats.setText(" &nbsp; | &nbsp; ".join(bits))
 
-
 # ---------- Activation heatmap with fixed colorbar axis ----------
 class _ActTab(QtWidgets.QWidget):
     """Activation heatmap with a fixed, dedicated colorbar axis."""
@@ -156,9 +194,13 @@ class _ActTab(QtWidgets.QWidget):
             lbl = QtWidgets.QLabel(f"<b>{title}</b>")
             lay.addWidget(lbl)
         lay.addWidget(self.canvas)
-        self._last_norm = None
-        self._last_cmap = None
+        # optional fixed scale across recomputes (set once if you want)
+        self._fixed_vmin = None
+        self._fixed_vmax = None
 
+    def set_fixed_scale(self, vmin=None, vmax=None):
+        self._fixed_vmin = vmin
+        self._fixed_vmax = vmax
 
 # ---------- Isolation tab with modulation vector readout ----------
 class _IsolationTab(QtWidgets.QWidget):
@@ -213,7 +255,6 @@ class _IsolationTab(QtWidgets.QWidget):
             return
 
         col = self.combo.currentText()     # e.g., "LW_isolating"
-        # Use LEDs present in the mods table, restricted/ordered by current config
         leds_all = list(self._mods.index)
         leds = [L for L in (_ordered_leds(self._leds_in_use or leds_all)) if L in leds_all]
         if not leds:
@@ -222,34 +263,28 @@ class _IsolationTab(QtWidgets.QWidget):
         vals = self._mods.loc[leds, col].to_numpy(float)
         bar_colors = [LED_COLORS.get(L, "gray") for L in leds]
 
-        # Bar plot
         self.ax.bar(leds, vals, color=bar_colors)
         self.ax.set_title(f"LED modulation for {col}")
         self.ax.axhline(0, color="black", linewidth=0.8)
         self.ax.set_ylabel("Relative LED modulation")
         self.canvas.draw_idle()
 
-        # Vector readout like "RGB: 1.00, -0.50, 0.22"
         code = _led_set_code(leds)
-        vec_txt = ", ".join(f"{v:+.2f}".replace("+", "") for v in vals)  # drop '+' for positives
-        # color the initials inline
+        vec_txt = ", ".join(f"{v:+.2f}".replace("+", "") for v in vals)
         initials = []
         for L in leds:
             initial = "U" if L == "UV" else L[0]
             color = LED_COLORS.get(L, "black")
             initials.append(f'<span style="color:{color}">{initial}</span>')
         label_html = f"<b>{''.join(initials)}:</b> {vec_txt}"
-        # Use standard code (RGB/RGUV/GBUV) if it matches a known set
         if code in ("RGB", "RGUV", "GBUV"):
             label_html = f"<b>{code}:</b> {vec_txt}"
         self.vec_label.setText(label_html)
-
 
 # ---------- Container ----------
 class Plots(QtWidgets.QTabWidget):
     def __init__(self):
         super().__init__()
-        # Tabs
         self.tab_flux  = _PhotonFluxTab("Photon flux (selected LEDs)")
         self.tab_nomo  = _MplTab("Opsin nomograms")
         self.tab_act   = _ActTab("Activation matrix (LED × Opsin)")
@@ -276,7 +311,6 @@ class Plots(QtWidgets.QTabWidget):
         self.tab_iso.set_modulations(modulations_df, selected_leds)
 
     def update_photon_flux(self, photon_flux_df, leds):
-        # Exposed for callers that want to refresh flux alone
         self.tab_flux.update_plot(photon_flux_df, leds)
 
     # ---- Tab renderers ----
@@ -318,10 +352,17 @@ class Plots(QtWidgets.QTabWidget):
             self.tab_act.canvas.draw_idle()
             return
 
-        # Heatmap
-        im = self.tab_act.ax.imshow(A.values, aspect="auto")
+        data = A.to_numpy(dtype=float)
 
-        # Axes labels
+        vmin = self.tab_act._fixed_vmin
+        vmax = self.tab_act._fixed_vmax
+        if vmin is None:
+            vmin = float(np.nanmin(data))
+        if vmax is None:
+            vmax = float(np.nanmax(data)) if np.isfinite(np.nanmax(data)) else None
+
+        im = self.tab_act.ax.imshow(data, aspect="auto", vmin=vmin, vmax=vmax)
+
         self.tab_act.ax.set_xticks(range(len(A.columns)))
         self.tab_act.ax.set_xticklabels(A.columns, rotation=45, ha="right")
         self.tab_act.ax.set_yticks(range(len(A.index)))
@@ -329,11 +370,10 @@ class Plots(QtWidgets.QTabWidget):
         self.tab_act.ax.set_title("Activation (LED × Opsin)")
 
         # ---- Annotate each cell with scientific notation ----
-        data = A.to_numpy(dtype=float)
-        # fallback linear normalization if im.norm not present
-        vmin = float(np.nanmin(data))
-        vmax = float(np.nanmax(data))
-        denom = (vmax - vmin) if np.isfinite(vmax - vmin) and (vmax - vmin) > 0 else 1.0
+        # safe denom for fallback mapping
+        dmin = float(np.nanmin(data))
+        dmax = float(np.nanmax(data))
+        denom = (dmax - dmin) if np.isfinite(dmax - dmin) and (dmax - dmin) > 0 else 1.0
 
         for i in range(A.shape[0]):
             for j in range(A.shape[1]):
@@ -343,21 +383,18 @@ class Plots(QtWidgets.QTabWidget):
                     bg_level = 0.5
                 else:
                     s = f"{val:.2e}"
-                    # map value to 0..1 for contrast check
                     if getattr(im, "norm", None) is not None:
                         try:
                             bg_level = im.norm(val)
                         except Exception:
-                            bg_level = (val - vmin) / denom
+                            bg_level = (val - dmin) / denom
                     else:
-                        bg_level = (val - vmin) / denom
+                        bg_level = (val - dmin) / denom
                 color = "white" if bg_level > 0.5 else "black"
                 self.tab_act.ax.text(j, i, s, ha="center", va="center", fontsize=8, color=color)
 
         # Colorbar in the dedicated axis (stable layout)
-        cmappable = cm.ScalarMappable(norm=im.norm, cmap=im.cmap)
         ColorbarBase(self.tab_act.cax, cmap=im.cmap, norm=im.norm, orientation="vertical")
         self.tab_act.cax.set_ylabel("Activation (∫ φ(λ)·S(λ) dλ)")
 
         self.tab_act.canvas.draw_idle()
-

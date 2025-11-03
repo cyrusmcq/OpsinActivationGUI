@@ -32,6 +32,35 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.addWidget(self.controls, 0)
         layout.addWidget(self.plots, 1)
 
+        # === LED power sets (nW for a 250 µm spot) ===
+        self._POWER_SETS_NW = {
+            "Current":                  {"Red": 1430.0, "Green": 168.0,  "Blue": 259.0,  "UV": 214.0},
+            "2025-04-30 – 2025-07-19": {"Red": 2856.0, "Green": 242.1,  "Blue": 813.0,  "UV": 887.0},
+            "2024-11-06 – 2025-04-29": {"Red": 184.5,  "Green": 26.64,  "Blue": 40.69,  "UV": 31.15},
+            "2024-06-05 – 2024-11-04": {"Red": 756.0,  "Green": 112.0,  "Blue": 410.0,  "UV": 370.0},
+        }
+
+        def _powers_watts_from_key(key: str) -> dict:
+            # Fallback-friendly: if control not present or key missing, use Current
+            if not key:
+                key = "Current"
+            sel = self._POWER_SETS_NW.get(key, self._POWER_SETS_NW["Current"])
+            return {k: v * 1e-9 for k, v in sel.items()}  # nW -> W
+
+        self._powers_watts_from_key = _powers_watts_from_key
+
+        # --- Cache photon flux BASE using the current dropdown selection (if present) ---
+        try:
+            power_key = self.controls.current_power_key()
+        except Exception:
+            power_key = "Current"
+
+        self._photon_flux_base = process_led_data(
+            led_powers_watts=self._powers_watts_from_key(power_key)
+        )
+        self._photon_flux = self._photon_flux_base.copy()  # working (attenuated) copy
+
+
         # cache photon flux (all LEDs available)
         self._photon_flux = process_led_data()
         self._photon_flux_base = self._photon_flux.copy()  # pristine (no ND)
@@ -81,6 +110,16 @@ class MainWindow(QtWidgets.QMainWindow):
             species = self.controls.current_species()
             leds = self.controls.selected_leds()
 
+            # === Refresh photon-flux BASE from the selected power set ===
+            try:
+                power_key = self.controls.current_power_key()
+            except Exception:
+                power_key = "Current"
+
+            self._photon_flux_base = process_led_data(
+                led_powers_watts=self._powers_watts_from_key(power_key)
+            )
+
             # --- ND + PMT attenuation ---
             try:
                 od_val = self.controls.nd_optical_density()
@@ -101,7 +140,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
             # Apply attenuation to a pristine copy
             pf = self._photon_flux_base.copy()
-            # scale both styles of columns if present
             for col in pf.columns:
                 if col.endswith("_PhotonFlux") or col in ("Red", "Green", "Blue", "UV"):
                     pf[col] = pf[col] * transmission

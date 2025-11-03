@@ -50,6 +50,19 @@ class Controls(QtWidgets.QWidget):
         self.exactinv_chk.setChecked(True)
         v.addWidget(self.exactinv_chk)
 
+        # === NEW: LED power calibration (date ranges) ===
+        v.addWidget(QtWidgets.QLabel("LED power calibration"))
+        self.power_combo = QtWidgets.QComboBox()
+        # Keys are user-visible labels; app.py will map them to numbers
+        self.power_combo.addItems([
+            "Current",
+            "2025-04-30 – 2025-07-19",
+            "2024-11-06 – 2025-04-29",
+            "2024-06-05 – 2024-11-04",
+        ])
+        self.power_combo.setToolTip("Sets R/G/B/UV power (nW) for a 250 µm spot")
+        v.addWidget(self.power_combo)
+
         # --- Save button ---
         self.save_btn = QtWidgets.QPushButton("Save matrices to CSV…")
         self.save_btn.setEnabled(False)  # enabled after first compute
@@ -64,6 +77,7 @@ class Controls(QtWidgets.QWidget):
         self.equalize_chk.stateChanged.connect(self._emit_params_changed)
         self.exactinv_chk.stateChanged.connect(self._emit_params_changed)
         self.pmt_chk.stateChanged.connect(self._emit_params_changed)
+        self.power_combo.currentIndexChanged.connect(self.paramsChanged)
 
         # Save button emits a separate signal
         self.save_btn.clicked.connect(lambda *_: self.saveMatricesClicked.emit())
@@ -95,3 +109,6 @@ class Controls(QtWidgets.QWidget):
 
     def use_exact_inverse(self) -> bool:
         return self.exactinv_chk.isChecked()
+
+    def current_power_key(self) -> str:
+        return self.power_combo.currentText()

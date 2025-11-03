@@ -154,14 +154,17 @@ def normalize_spectra(corrected_df: pd.DataFrame) -> pd.DataFrame:
 # ---------------------------------------------------------------------
 # 5. Convert to photon flux (photons/s/µm²)
 # ---------------------------------------------------------------------
-def convert_to_photon_flux(normalized_df: pd.DataFrame) -> pd.DataFrame:
+def convert_to_photon_flux(normalized_df: pd.DataFrame, led_powers_watts: dict | None = None) -> pd.DataFrame:
     """
     Convert normalized spectra to photon flux using measured LED powers.
     Returns ONLY: ['Wavelength', 'Red_PhotonFlux', ...]
     """
     h = 6.62607015e-34
     c = 2.99792458e8
-    led_powers = {"Red": 1.43e-6, "Green": 1.68e-7, "Blue": 2.59e-7, "UV": 2.140e-7}
+    # DEFAULT (Watts) = the "Current" set for a 250 µm spot
+    default_led_powers = {"Red": 1.43e-6, "Green": 1.68e-7, "Blue": 2.59e-7, "UV": 2.140e-7}
+    led_powers = dict(default_led_powers if led_powers_watts is None else led_powers_watts)
+
     wl = normalized_df["Wavelength"].values
     lam_m = wl * 1e-9
     E = (h * c) / lam_m
@@ -173,7 +176,7 @@ def convert_to_photon_flux(normalized_df: pd.DataFrame) -> pd.DataFrame:
         spectrum = normalized_df[col].values
         if led not in led_powers:
             continue
-        P = led_powers[led]
+        P = led_powers[led]  # Watts
         mask = ~np.isnan(spectrum)
         if mask.sum() > 1:
             avg_E = np.trapezoid(E[mask] * spectrum[mask], wl[mask])
@@ -182,17 +185,14 @@ def convert_to_photon_flux(normalized_df: pd.DataFrame) -> pd.DataFrame:
                 photons_total = P / avg_E
                 out[f"{led}_PhotonFlux"] = (photons_total / spot_area) * spectrum
                 continue
-        # fallback (no valid avg_E)
         out[f"{led}_PhotonFlux"] = np.full_like(wl, np.nan, dtype=float)
     return pd.DataFrame(out)
 
 
-# ---------------------------------------------------------------------
-# 6. Convenience pipeline
-# ---------------------------------------------------------------------
 def process_led_data(
     led_csv: Path = LED_SPECTRA_PATH,
-    powermeter_csv: Path = POWERMETER_PATH
+    powermeter_csv: Path = POWERMETER_PATH,
+    led_powers_watts: dict | None = None,   # <-- NEW
 ) -> pd.DataFrame:
     """
     End-to-end LED processing pipeline returning photon flux spectra.
@@ -201,7 +201,7 @@ def process_led_data(
     corr = calculate_powermeter_corrections(powermeter_csv, wavelengths)
     corr_applied = apply_power_meter_corrections(eff, corr)
     norm = normalize_spectra(corr_applied)
-    photon_flux = convert_to_photon_flux(norm)
+    photon_flux = convert_to_photon_flux(norm, led_powers_watts=led_powers_watts)  # <-- NEW
     return photon_flux
 # ---------------------------------------------------------------------
 # 7. Save-all pipeline (for quick verification)

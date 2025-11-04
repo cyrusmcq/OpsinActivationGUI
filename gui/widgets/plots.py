@@ -221,6 +221,10 @@ class _IsolationTab(QtWidgets.QWidget):
         self.contrast_label = QtWidgets.QLabel("")
         self.contrast_label.setTextFormat(QtCore.Qt.TextFormat.RichText)
 
+        # mid-gray + amplitude readout (appears under the header)
+        self.mid_label = QtWidgets.QLabel("")
+        self.mid_label.setTextFormat(QtCore.Qt.TextFormat.RichText)
+
         # right-side box: vector on top, contrast under it
         right_box = QtWidgets.QVBoxLayout()
         right_box.setContentsMargins(0, 0, 0, 0)
@@ -236,6 +240,7 @@ class _IsolationTab(QtWidgets.QWidget):
 
         lay = QtWidgets.QVBoxLayout(self)
         lay.addLayout(header)
+        lay.addWidget(self.mid_label)
         lay.addWidget(self.canvas)
 
         self.combo.currentIndexChanged.connect(self._redraw)
@@ -247,6 +252,23 @@ class _IsolationTab(QtWidgets.QWidget):
         # amplitude & matching state
         self._match_mod = False     # set from Controls checkbox
         self._beta = 0.5            # global amplitude around gray (0..0.5 typical)
+
+    def set_midgray_info(self, mid_df: 'pd.DataFrame|None', gamma_global: float | None):
+        """
+        mid_df: index=LED, columns ['p','n','gamma_max','b']
+        gamma_global: min across LEDs of gamma_max (matched-amplitude ceiling)
+        """
+        if mid_df is None or mid_df.empty:
+            self.mid_label.setText("")
+            return
+
+        parts = []
+        for led in [L for L in _ordered_leds(list(mid_df.index)) if L in mid_df.index]:
+            b = float(mid_df.loc[led, "b"])
+            parts.append(f"{led[0] if led != 'UV' else 'U'}: {b:.3f}")
+        led_bits = " • ".join(parts)
+        amp_text = f" | max matched amplitude γ = {gamma_global:.3f}" if gamma_global is not None else ""
+        self.mid_label.setText(f"<b>Mid-gray per LED</b> ({led_bits}){amp_text}")
 
     def set_match_modulation(self, match: bool):
         self._match_mod = bool(match)
@@ -404,6 +426,10 @@ class Plots(QtWidgets.QTabWidget):
         self._update_nomograms(nomograms_df, species)
         self._update_activation(activation_matrix)
         self.tab_iso.set_modulations(modulations_df, selected_leds, activation_matrix)
+
+    def set_midgray(self, mid_df, gamma_global=None):
+        if hasattr(self, "tab_iso"):
+            self.tab_iso.set_midgray_info(mid_df, gamma_global)
 
     def update_photon_flux(self, photon_flux_df, leds):
         self.tab_flux.update_plot(photon_flux_df, leds)

@@ -1,7 +1,7 @@
 from PyQt6 import QtWidgets, QtCore
 from opsinlab.io_led import process_led_data
 from opsinlab.nomograms import generate_nomograms, available_species, interpolate_nomograms
-from opsinlab.activation import isolation_pipeline
+from opsinlab.activation import isolation_pipeline, compute_midgray_and_amplitude
 from gui.widgets.controls import Controls
 from gui.widgets.plots import Plots
 from opsinlab.activation import opsin_weighted_isomerizations
@@ -189,16 +189,26 @@ class MainWindow(QtWidgets.QMainWindow):
             # update plots once
             A = out["ActivationMatrix"]
             mods = out["Modulations"]
+
+            # --- mid-gray + amplitude ---
+            try:
+                mid = compute_midgray_and_amplitude(mods)
+                gamma_global = float(mid["gamma_max"].min()) if not mid.empty else None
+            except Exception:
+                mid = None
+                gamma_global = None
+
             self.plots.update_all(
                 photon_flux_df=pf,
-                nomograms_df=nomo_200_700,
+                nomograms_df=nomo,
                 activation_matrix=A,
                 modulations_df=mods,
                 selected_leds=leds,
                 species=species,
             )
-            if hasattr(self.plots.tab_flux, "set_isom_summary"):
-                self.plots.tab_flux.set_isom_summary(iso_rates)
+            # push mid-gray readout
+            if hasattr(self.plots, "set_midgray"):
+                self.plots.set_midgray(mid, gamma_global)
 
             # also echo to status bar so you always see a readout
             sb_text = self._format_iso_summary(iso_rates)

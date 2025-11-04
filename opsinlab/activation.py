@@ -245,6 +245,31 @@ def opsin_weighted_isomerizations(
         "Rstar_per_opsin": R_per_opsin,
         "Rstar_per_opsin_perLED": perLED,
     }
+def compute_midgray_and_amplitude(mods_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Given Mods (rows=LEDs, cols='<opsin>_isolating'), compute for each LED:
+      - p: max positive excursion across isolations
+      - n: max negative excursion magnitude across isolations
+      - gamma_max: largest symmetric amplitude that fits [0,1] for this LED
+      - b: ideal mid-gray centering the headroom for this LED
+
+    Returns a DataFrame indexed by LED with columns ['p','n','gamma_max','b'].
+    """
+    if mods_df is None or mods_df.empty:
+        return pd.DataFrame(columns=["p","n","gamma_max","b"])
+
+    leds = list(mods_df.index)
+    cols = list(mods_df.columns)
+    out = []
+    for led in leds:
+        s = mods_df.loc[led, cols].astype(float).to_numpy()
+        p = float(np.max(np.maximum(s, 0.0)))
+        n = float(np.max(np.maximum(-s, 0.0)))
+        denom = p + n
+        gamma_max = (1.0 / denom) if denom > 0 else 0.0
+        b = 0.5 * (1.0 + gamma_max * (n - p))
+        out.append((led, p, n, gamma_max, b))
+    return pd.DataFrame(out, columns=["LED","p","n","gamma_max","b"]).set_index("LED")
 
 # ----------------------------- Pipeline -----------------------------
 def isolation_pipeline(

@@ -215,15 +215,24 @@ class _IsolationTab(QtWidgets.QWidget):
         self.ax = self.fig.add_subplot(111)
         self.canvas = FigureCanvas(self.fig)
 
-        # vector readout (right side of the header row)
+        # two labels
         self.vec_label = QtWidgets.QLabel("")
         self.vec_label.setTextFormat(QtCore.Qt.TextFormat.RichText)
+        self.contrast_label = QtWidgets.QLabel("")
+        self.contrast_label.setTextFormat(QtCore.Qt.TextFormat.RichText)
 
+        # right-side box: vector on top, contrast under it
+        right_box = QtWidgets.QVBoxLayout()
+        right_box.setContentsMargins(0, 0, 0, 0)
+        right_box.addWidget(self.vec_label, alignment=QtCore.Qt.AlignmentFlag.AlignRight)
+        right_box.addWidget(self.contrast_label, alignment=QtCore.Qt.AlignmentFlag.AlignRight)
+
+        # header row
         header = QtWidgets.QHBoxLayout()
         header.addWidget(QtWidgets.QLabel("Show isolation for:"))
         header.addWidget(self.combo)
         header.addStretch(1)
-        header.addWidget(self.vec_label)
+        header.addLayout(right_box)  # <<— now stacked
 
         lay = QtWidgets.QVBoxLayout(self)
         lay.addLayout(header)
@@ -231,13 +240,30 @@ class _IsolationTab(QtWidgets.QWidget):
 
         self.combo.currentIndexChanged.connect(self._redraw)
 
+        self._A = None  # ActivationMatrix (LED × Opsin) for all opsins
+        self._leds3 = None  # the selected trio order
         self._mods = None          # DataFrame: index = LEDs, columns = '<opsin>_isolating'
         self._leds_in_use = None   # list like ['Red','Green','Blue'] (for ordering & code)
+        # amplitude & matching state
+        self._match_mod = False     # set from Controls checkbox
+        self._beta = 0.5            # global amplitude around gray (0..0.5 typical)
 
-    def set_modulations(self, mods_df, leds_in_use):
+    def set_match_modulation(self, match: bool):
+        self._match_mod = bool(match)
+        self._redraw()
+
+    def set_amplitude(self, beta: float):
+        # beta is how far you modulate around gray per LED: d = 0.5 ± beta*m
+        self._beta = float(max(0.0, beta))
+        self._redraw()
+
+
+    def set_modulations(self, mods_df, leds_in_use, activation_matrix):
         """mods_df: DataFrame with rows=LEDs and columns '<opsin>_isolating'."""
         self._mods = mods_df
         self._leds_in_use = list(leds_in_use) if leds_in_use else None
+        self._A = activation_matrix
+        self._leds3 = list(leds_in_use) if leds_in_use else None
 
         self.combo.blockSignals(True)
         self.combo.clear()
@@ -276,10 +302,79 @@ class _IsolationTab(QtWidgets.QWidget):
             initial = "U" if L == "UV" else L[0]
             color = LED_COLORS.get(L, "black")
             initials.append(f'<span style="color:{color}">{initial}</span>')
-        label_html = f"<b>{''.join(initials)}:</b> {vec_txt}"
-        if code in ("RGB", "RGUV", "GBUV"):
-            label_html = f"<b>{code}:</b> {vec_txt}"
+        label_html = f"<b>{code if code in ('RGB', 'RGUV', 'GBUV') else ''.join(initials)}:</b> {vec_txt}"
         self.vec_label.setText(label_html)
+
+        # --- Contrast at gray 50% (Weber, equals Michelson here) ---
+        try:
+            c = self._contrast_at_gray(col, leds)
+            if c is None:
+                self.contrast_label.setText("")
+            else:
+                contrast, A_gray, beta_eff = c
+                c_pct = 100.0 * contrast if np.isfinite(contrast) else float("nan")
+                mode = "matched" if self._match_mod else "raw"
+                self.contrast_label.setText(
+                    f"<b>Contrast:</b> {c_pct:.1f}% @ β = {beta_eff:.3f} [{mode}]"
+                    f" &nbsp; <span style='color:#555'>gray A: {A_gray:.2e}</span>"
+                )
+        except Exception:
+            self.contrast_label.setText("")
+
+
+
+    def _contrast_at_gray(self, target_col: str, leds_order: list[str]) -> tuple[float, float, float] | None:
+        """
+        Returns (contrast_fraction, A_gray, beta_eff).
+        Uses fixed gray = 0.5 per LED and global amplitude beta (capped to avoid clipping).
+        If self._match_mod is True, the modulation vector m is normalized to ||m||_inf = 1.
+        """
+        if self._A is None or self._mods is None or not leds_order:
+            return None
+
+        # Ensure LEDs exist in both tables
+        for L in leds_order:
+            if L not in self._A.index or L not in self._mods.index:
+                return None
+
+        # raw modulation vector for this isolation, in LED order
+        m_raw = self._mods.loc[leds_order, target_col].to_numpy(float).reshape(-1)
+
+        # "Match modulation" mode: normalize so max |component| = 1
+        if self._match_mod:
+            denom = np.max(np.abs(m_raw)) if m_raw.size else 0.0
+            m = (m_raw / denom) if denom > 0 else m_raw.copy()
+        else:
+            m = m_raw
+
+        # fixed gray vector and user amplitude
+        gray = np.full(len(leds_order), 0.5, dtype=float)
+        beta = float(self._beta)
+
+        # per-isolation clipping limit at gray (so 0 <= 0.5 ± beta*m_i <= 1)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            per_led_limits = np.where(m != 0, 0.5 / np.abs(m), np.inf)
+        beta_clip = float(np.min(per_led_limits)) if per_led_limits.size else np.inf
+        beta_eff  = min(beta, beta_clip) if np.isfinite(beta_clip) else beta
+
+        # opsin key (strip suffix)
+        ops_key = target_col.replace("_isolating", "")
+        if ops_key not in self._A.columns:
+            return None
+
+        # A is LED × Opsin; pull opsin column in LED order
+        a_col = self._A.loc[leds_order, ops_key].to_numpy(float).reshape(-1)
+
+        A_gray = float(a_col @ gray)
+        if not np.isfinite(A_gray) or A_gray <= 0:
+            return None
+
+        delta = float(a_col @ (beta_eff * m))  # change from gray to ON
+        contrast = delta / A_gray              # Weber at gray (== Michelson for ±)
+        return (contrast, A_gray, beta_eff)
+
+
+
 
 # ---------- Container ----------
 class Plots(QtWidgets.QTabWidget):
@@ -308,7 +403,7 @@ class Plots(QtWidgets.QTabWidget):
         self._update_flux(photon_flux_df, selected_leds)
         self._update_nomograms(nomograms_df, species)
         self._update_activation(activation_matrix)
-        self.tab_iso.set_modulations(modulations_df, selected_leds)
+        self.tab_iso.set_modulations(modulations_df, selected_leds, activation_matrix)
 
     def update_photon_flux(self, photon_flux_df, leds):
         self.tab_flux.update_plot(photon_flux_df, leds)

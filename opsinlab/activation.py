@@ -297,6 +297,63 @@ def isolation_pipeline(
         "use_exact_inverse": use_exact_inverse,
     }
 
+# --- Contrast helper (Weber at gray 50%) ---
+def isolation_contrast_from_A_and_mod(
+    A_full: pd.DataFrame,   # LED × Opsin (for the 3 selected LEDs at least)
+    leds3: list[str],       # the trio in use, order matters
+    target_opsin: str,      # e.g., "LW_isolating" -> target_opsin = "LW"
+    mod_vec: np.ndarray,    # shape (3,), the column from Modulations for that target
+    gray_level: float = 0.5 # per-LED gray
+) -> dict:
+    """
+    Returns dict with: alpha_max, A_gray, d_on, d_off, contrast_weber (fraction),
+    and a convenience percent field.
+    """
+    # 3×1 LED vector at gray
+    d0 = np.full(3, float(gray_level))
+    # 3×1 modulation
+    m = np.asarray(mod_vec, dtype=float).reshape(3)
+
+    # Clip-safe amplitude
+    with np.errstate(divide="ignore", invalid="ignore"):
+        per_led_limits = np.where(m != 0, (gray_level / np.abs(m)), np.inf)
+    alpha_max = float(np.min(per_led_limits))
+
+    # Use alpha_max by default (largest unclipped symmetric contrast)
+    alpha = alpha_max
+
+    # Pull A3 (LED×Opsin) restricted to the trio and the full set of opsins
+    A3 = A_full.loc[leds3, :]
+    # Extract the plain opsin key (strip "_isolating" if present)
+    ops_key = target_opsin.replace("_isolating", "")
+    if ops_key not in A3.columns:
+        raise KeyError(f"Opsin '{ops_key}' not found in ActivationMatrix columns.")
+
+    a_col = A3[ops_key].to_numpy(float)  # shape (3,)
+
+    A_gray = float(a_col @ d0)
+    delta  = float(a_col @ (alpha * m))
+    A_on   = A_gray + delta
+    A_off  = A_gray - delta
+
+    # Weber (== Michelson here)
+    contrast = delta / A_gray if A_gray > 0 else np.nan
+
+    # Return LED drive vectors too (in case you want to display them)
+    d_on  = d0 + alpha * m
+    d_off = d0 - alpha * m
+
+    return {
+        "alpha_max": alpha_max,
+        "A_gray": A_gray,
+        "A_on": A_on,
+        "A_off": A_off,
+        "contrast_weber": contrast,
+        "contrast_percent": (100.0 * contrast) if np.isfinite(contrast) else np.nan,
+        "d_on": d_on,
+        "d_off": d_off,
+    }
+
 # ----------------------------- Back-compat alias -----------------------------
 def activation_pipeline(*args, **kwargs):
     """Backward-compat: old name -> new isolation_pipeline."""
@@ -315,3 +372,4 @@ __all__ = [
     "COLLECTING_AREAS_BY_SPECIES",
     "CollectingAreas",
 ]
+

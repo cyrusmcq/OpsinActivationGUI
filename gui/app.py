@@ -1,11 +1,12 @@
 from PyQt6 import QtWidgets, QtCore
 from opsinlab.io_led import process_led_data
-from opsinlab.nomograms import generate_nomograms, available_species
+from opsinlab.nomograms import generate_nomograms, available_species, interpolate_nomograms
 from opsinlab.activation import isolation_pipeline
 from gui.widgets.controls import Controls
 from gui.widgets.plots import Plots
 from opsinlab.activation import opsin_weighted_isomerizations
 
+import numpy as np
 import os
 from datetime import datetime
 import pandas as pd
@@ -59,11 +60,6 @@ class MainWindow(QtWidgets.QMainWindow):
             led_powers_watts=self._powers_watts_from_key(power_key)
         )
         self._photon_flux = self._photon_flux_base.copy()  # working (attenuated) copy
-
-
-        # cache photon flux (all LEDs available)
-        self._photon_flux = process_led_data()
-        self._photon_flux_base = self._photon_flux.copy()  # pristine (no ND)
 
         # last outputs cache for saving
         self._last_out = None
@@ -145,9 +141,22 @@ class MainWindow(QtWidgets.QMainWindow):
                     pf[col] = pf[col] * transmission
             self._photon_flux = pf
 
-            # Nomograms on same wavelength grid
-            wl = pf["Wavelength"].values
-            nomo = generate_nomograms(species, wl, normalize=True)
+            # LED grid (e.g., 300–700 from your photon-flux table)
+            wl_led = pf["Wavelength"].to_numpy(dtype=float)
+            wl_master = np.arange(200.0, 701.0, 1.0)  # 200–700 nm, 1-nm steps
+
+            # Build master 200–700 nm grid and normalize area over 200–700
+            nomo_200_700 = generate_nomograms(
+                species,
+                wl_master,
+                normalize=True,  # area = 1 over 200–700
+            )
+
+            if hasattr(self.plots, "update_nomogram_plot"):
+                self.plots.update_nomogram_plot(nomo_200_700)
+
+            # Interpolate back to the LED grid for all math (alignment guaranteed)
+            nomo = interpolate_nomograms(nomo_200_700, wl_led)
 
             # Isolation settings
             strategy = "match_across_isolations" if self.controls.match_across_isolations() else "per_isolation_max"
@@ -182,7 +191,7 @@ class MainWindow(QtWidgets.QMainWindow):
             mods = out["Modulations"]
             self.plots.update_all(
                 photon_flux_df=pf,
-                nomograms_df=nomo,
+                nomograms_df=nomo_200_700,
                 activation_matrix=A,
                 modulations_df=mods,
                 selected_leds=leds,

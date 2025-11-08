@@ -1,7 +1,7 @@
 from PyQt6 import QtWidgets, QtCore
 from opsinlab.io_led import process_led_data
 from opsinlab.nomograms import generate_nomograms, available_species, interpolate_nomograms
-from opsinlab.activation import isolation_pipeline, compute_midgray_and_amplitude
+from opsinlab.activation import isolation_pipeline, compute_midgray_and_amplitude, recommend_led_power_ratios
 from gui.widgets.controls import Controls
 from gui.widgets.plots import Plots
 from opsinlab.activation import opsin_weighted_isomerizations
@@ -29,6 +29,7 @@ class MainWindow(QtWidgets.QMainWindow):
             species_list=available_species(),
             led_configs=["RGB", "RGUV", "GBUV"],
         )
+
         self.plots = Plots()
         layout.addWidget(self.controls, 0)
         layout.addWidget(self.plots, 1)
@@ -36,6 +37,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # === LED power sets (nW for a 250 µm spot) ===
         self._POWER_SETS_NW = {
             "Current":                  {"Red": 1430.0, "Green": 168.0,  "Blue": 259.0,  "UV": 214.0},
+            "test":                    {"Red": 3, "Green": 1,  "Blue": 0.97,  "UV": 0.41},
             "2025-04-30 – 2025-07-19": {"Red": 2856.0, "Green": 242.1,  "Blue": 813.0,  "UV": 887.0},
             "2024-11-06 – 2025-04-29": {"Red": 184.5,  "Green": 26.64,  "Blue": 40.69,  "UV": 31.15},
             "2024-06-05 – 2024-11-04": {"Red": 756.0,  "Green": 112.0,  "Blue": 410.0,  "UV": 370.0},
@@ -69,6 +71,14 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # wire events
         self.controls.paramsChanged.connect(self.recompute)
+
+        # ensure single connection just like saveMatricesClicked
+        try:
+            self.controls.recommendRatiosClicked.disconnect(self._recommend_led_ratios)
+        except (TypeError, AttributeError):
+            pass
+        self.controls.recommendRatiosClicked.connect(self._recommend_led_ratios)
+
         # ensure single connection
         try:
             self.controls.saveMatricesClicked.disconnect(self._save_matrices)
@@ -286,6 +296,71 @@ class MainWindow(QtWidgets.QMainWindow):
 
         finally:
             self._saving = False
+
+    def _recommend_led_ratios(self):
+        """
+        Compute recommended relative LED power multipliers (unitless, max=1)
+        and the corresponding LED powers in nW for the currently selected
+        calibration set and species/LED trio.
+        """
+        try:
+            species = self.controls.current_species()
+            leds = self.controls.selected_leds()
+            power_key = self.controls.current_power_key()
+
+            # Ensure we have an ActivationMatrix available
+            if not self._last_out:
+                pf = self._photon_flux
+                wl_led = pf["Wavelength"].to_numpy(dtype=float)
+                wl_master = np.arange(200.0, 701.0, 1.0)
+                nomo_200_700 = generate_nomograms(species, wl_master, normalize=True)
+                nomo = interpolate_nomograms(nomo_200_700, wl_led)
+                out = isolation_pipeline(
+                    photon_flux_df=pf,
+                    nomograms_df=nomo,
+                    species=species,
+                    selected_leds_3=leds,
+                    strategy=(
+                        "match_across_isolations" if self.controls.match_across_isolations() else "per_isolation_max"),
+                    use_exact_inverse=self.controls.use_exact_inverse(),
+                )
+            else:
+                out = self._last_out
+
+            A_full = out["ActivationMatrix"]
+            ops3 = out["opsins3"]
+            A0 = A_full.loc[leds, ops3]  # 3×3 base matrix
+
+            # --- compute relative power ratios (max = 1.0) ---
+            ratios = recommend_led_power_ratios(A0)
+
+            # --- compute scaled absolute powers (nW) from current calibration set ---
+            base_powers_nw = self._POWER_SETS_NW.get(power_key, self._POWER_SETS_NW["Current"])
+            powers_scaled = {led: float(base_powers_nw.get(led, 0.0)) * float(ratios.get(led, 1.0))
+                             for led in leds}
+
+            # --- pretty print ---
+            ratio_txt = ", ".join(f"{led}={val:.2f}" for led, val in ratios.items())
+            power_txt = ", ".join(f"{led}={val:.1f} nW" for led, val in powers_scaled.items())
+
+            print(f"[Recommended LED ratios] {ratio_txt}")
+            print(f"[Recommended LED powers (nW, scaled from '{power_key}')] {power_txt}")
+
+            # --- display in Photon-Flux tab ---
+            if hasattr(self.plots, "set_ratio_summary"):
+                # combine both into one line
+                text = {
+                    "ratios": ratios,
+                    "powers": powers_scaled,
+                    "label": power_key,
+                }
+                self.plots.set_ratio_summary(text)
+
+            # --- status bar echo ---
+            self.statusBar().showMessage(f"LED ratios {ratio_txt} | powers (nW): {power_txt}")
+
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(self, "LED ratio recommendation failed", str(e))
 
 
 def main():

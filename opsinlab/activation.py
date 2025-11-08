@@ -271,6 +271,19 @@ def compute_midgray_and_amplitude(mods_df: pd.DataFrame) -> pd.DataFrame:
         out.append((led, p, n, gamma_max, b))
     return pd.DataFrame(out, columns=["LED","p","n","gamma_max","b"]).set_index("LED")
 
+def recommend_led_power_ratios(A0_3x3: pd.DataFrame) -> pd.Series:
+    """
+    A0_3x3: ActivationMatrix restricted to your 3 LEDs (rows) × 3 opsins (cols),
+            built from your current spectra and the species' opsins.
+    Returns a pd.Series k indexed by LED with recommended *relative* power multipliers.
+    """
+    # Q columns are raw isolation LED vectors for each opsin
+    Q = np.linalg.inv(A0_3x3.to_numpy().T)    # shape (3,3)
+    M = np.max(np.abs(Q), axis=1)             # worst required modulation per LED
+    # more power to LEDs that otherwise need bigger modulation
+    k = M / np.max(M)                         # normalize (max=1)
+    return pd.Series(k, index=A0_3x3.index, name="power_ratio")
+
 # ----------------------------- Pipeline -----------------------------
 def isolation_pipeline(
     photon_flux_df: pd.DataFrame,
@@ -396,5 +409,7 @@ __all__ = [
     "opsin_weighted_isomerizations",
     "COLLECTING_AREAS_BY_SPECIES",
     "CollectingAreas",
+    "compute_midgray_and_amplitude",
+    "recommend_led_power_ratios",
 ]
 

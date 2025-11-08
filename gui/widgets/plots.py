@@ -104,6 +104,43 @@ class _PhotonFluxTab(QtWidgets.QWidget):
         self.iso_stats.setTextFormat(QtCore.Qt.TextFormat.RichText)
         lay.addWidget(self.iso_stats)
 
+        self.ratio_stats = QtWidgets.QLabel("")
+        self.ratio_stats.setTextFormat(QtCore.Qt.TextFormat.RichText)
+        lay.addWidget(self.ratio_stats)
+
+    def set_ratio_summary(self, data):
+        """
+        Accepts either a pd.Series/dict of ratios, or a dict with
+        keys {'ratios':…, 'powers':…, 'label':…}
+        """
+        if data is None:
+            self.ratio_stats.setText("")
+            return
+
+        # unified parsing
+        if isinstance(data, dict) and "ratios" in data:
+            ratios = data.get("ratios", {})
+            powers = data.get("powers", {})
+            label = data.get("label", "")
+        else:
+            ratios = data
+            powers = None
+            label = ""
+
+        # assemble HTML
+        parts = []
+        for led, val in ratios.items():
+            parts.append(f"<b>{led}</b>: {val:.2f}")
+        ratio_html = " &nbsp; | &nbsp; ".join(parts)
+
+        if powers:
+            ptxt = ", ".join(f"{led}: {val:.1f} nW" for led, val in powers.items())
+            power_html = f"<br><span style='color:#555'>Scaled from '{label}': {ptxt}</span>"
+        else:
+            power_html = ""
+
+        self.ratio_stats.setText(f"<b>Recommended LED power ratios (max = 1)</b><br>{ratio_html}{power_html}")
+
     def set_isom_summary(self, iso_dict: dict | None):
         """
         Show opsin-weighted R*/s totals. Accepts the dict with 'Rstar_per_opsin'.
@@ -433,6 +470,9 @@ class Plots(QtWidgets.QTabWidget):
 
     def update_photon_flux(self, photon_flux_df, leds):
         self.tab_flux.update_plot(photon_flux_df, leds)
+
+    def set_ratio_summary(self, ratios):
+        self.tab_flux.set_ratio_summary(ratios)
 
     # ---- Tab renderers ----
     def _update_flux(self, pf_df, selected_leds):

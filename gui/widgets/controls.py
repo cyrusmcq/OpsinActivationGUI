@@ -11,6 +11,7 @@ class Controls(QtWidgets.QWidget):
     # Public signals the MainWindow listens to
     paramsChanged = QtCore.pyqtSignal()
     saveMatricesClicked = QtCore.pyqtSignal()
+    recommendRatiosClicked = QtCore.pyqtSignal()
 
     def __init__(self, species_list: List[str], led_configs: List[str]):
         super().__init__()
@@ -56,12 +57,19 @@ class Controls(QtWidgets.QWidget):
         # Keys are user-visible labels; app.py will map them to numbers
         self.power_combo.addItems([
             "Current",
+            "test",
             "2025-04-30 – 2025-07-19",
             "2024-11-06 – 2025-04-29",
             "2024-06-05 – 2024-11-04",
         ])
         self.power_combo.setToolTip("Sets R/G/B/UV power (nW) for a 250 µm spot")
         v.addWidget(self.power_combo)
+
+        #Recommend LED ratio button
+        self.recommend_btn = QtWidgets.QPushButton("Recommend LED ratios")
+        self.recommend_btn.setToolTip("Compute suggested relative LED powers for current species/LED trio")
+        v.addWidget(self.recommend_btn)  # or add to your existing buttons row
+        self.recommend_btn.clicked.connect(self.recommendRatiosClicked.emit)
 
         # --- Save button ---
         self.save_btn = QtWidgets.QPushButton("Save matrices to CSV…")
@@ -77,7 +85,7 @@ class Controls(QtWidgets.QWidget):
         self.equalize_chk.stateChanged.connect(self._emit_params_changed)
         self.exactinv_chk.stateChanged.connect(self._emit_params_changed)
         self.pmt_chk.stateChanged.connect(self._emit_params_changed)
-        self.power_combo.currentIndexChanged.connect(self.paramsChanged)
+        self.power_combo.currentIndexChanged.connect(self._emit_params_changed)
 
         # Save button emits a separate signal
         self.save_btn.clicked.connect(lambda *_: self.saveMatricesClicked.emit())

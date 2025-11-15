@@ -27,7 +27,263 @@ class BitmaskChannelData:
     powers_uW: np.ndarray     # per-bit powers in experiment mode (µW)
 
 
+def load_led_calibrations_from_csv(csv_path: str) -> dict:
+    """
+    Load LED calibration curves from LEDcurrent_power.csv.
+
+    Expected format (as in your file):
+        Unnamed: 0   640nm   550nm   465nm   390nm
+        Current (%)  Red     Green   Blue    UV
+        2.8          0.00017 ...
+
+    Returns
+    -------
+    cal_dict : dict[str, LedCalibration]
+        Keys: "Red", "Green", "Blue", "UV"
+    """
+    df = pd.read_csv(csv_path, encoding="latin1")
+
+    # First row is labels like "Current (%)", "Red (µW)", etc. → drop it.
+    df = df.iloc[1:].copy()
+
+    # Rename current column for clarity
+    df = df.rename(columns={"Unnamed: 0": "Current (%)"})
+
+    currents = df["Current (%)"].astype(float).to_numpy()
+
+    red_p   = df["640nm"].astype(float).to_numpy()
+    green_p = df["550nm"].astype(float).to_numpy()
+    blue_p  = df["465nm"].astype(float).to_numpy()
+    uv_p    = df["390nm"].astype(float).to_numpy()
+
+    red_cal   = LedCalibration("Red",   currents, red_p)
+    green_cal = LedCalibration("Green", currents, green_p)
+    blue_cal  = LedCalibration("Blue",  currents, blue_p)
+    uv_cal    = LedCalibration("UV",    currents, uv_p)
+
+    return {
+        "Red":   red_cal,
+        "Green": green_cal,
+        "Blue":  blue_cal,
+        "UV":    uv_cal,
+    }
+
+def load_currents_from_rgb_suggested(path: str, num_bits: int = 8):
+    """
+    Parse RGB_suggested.csv and return currents per bit for
+    Red, Green, Blue as arrays (LSB→MSB).
+    """
+    df = pd.read_csv(path)
+    B = num_bits
+
+    I_red   = np.zeros(B, dtype=float)
+    I_green = np.zeros(B, dtype=float)
+    I_blue  = np.zeros(B, dtype=float)
+
+    for b in range(B):  # b=0..7 (LSB..MSB)
+        row_base = (B - 1 - b) * 3
+        block = df.iloc[row_base:row_base+3]
+
+        for _, row in block.iterrows():
+            led = int(row["LED #"])
+            curr = float(row["LED current (%)"])
+            if led == 4:
+                I_red[b] = curr
+            elif led == 3:
+                I_green[b] = curr
+            elif led == 2:
+                I_blue[b] = curr
+
+    return I_red, I_green, I_blue
+
+
+def load_currents_from_gbuv_suggested(path: str, num_bits: int = 8):
+    """
+    Parse GBUV_suggested.csv and return currents per bit for
+    Green, Blue, UV as arrays (LSB→MSB).
+    """
+    df = pd.read_csv(path)
+    B = num_bits
+
+    I_green = np.zeros(B, dtype=float)
+    I_blue  = np.zeros(B, dtype=float)
+    I_uv    = np.zeros(B, dtype=float)
+
+    for b in range(B):
+        row_base = (B - 1 - b) * 3
+        block = df.iloc[row_base:row_base+3]
+
+        for _, row in block.iterrows():
+            led = int(row["LED #"])
+            curr = float(row["LED current (%)"])
+            if led == 3:
+                I_green[b] = curr
+            elif led == 2:
+                I_blue[b] = curr
+            elif led == 1:
+                I_uv[b] = curr
+
+    return I_green, I_blue, I_uv
+
+def load_bitmask_powers_from_csv(meas_path: str, led_name: str) -> np.ndarray:
+    """
+    Load measured bit-plane powers for a given LED from a CSV.
+
+    Supported formats:
+
+    1) LEDbitpower-style (nW):
+        LED, bg_nW, bit0_nW, bit1_nW, ..., bit7_nW
+
+    2) uW-style:
+        LED, background_uW, bit0_uW, ..., bit7_uW
+
+    Returns
+    -------
+    powers_uW : np.ndarray
+        Length-8 array, powers in µW, ordered LSB→MSB, with background subtracted.
+    """
+    df = pd.read_csv(meas_path)
+
+    # Pick the row for this LED
+    row = df.loc[df["LED"].str.lower() == led_name.lower()]
+    if row.empty:
+        raise ValueError(f"No measurement row found for LED '{led_name}' in {meas_path}")
+    row = row.iloc[0]
+
+    # Detect background column and units
+    if "background_uW" in df.columns:
+        background = float(row.get("background_uW", 0.0))
+        unit_factor = 1.0   # already µW
+        col_suffix = "_uW"
+    elif "bg_nW" in df.columns:
+        background = float(row.get("bg_nW", 0.0))
+        unit_factor = 1e-3  # nW → µW
+        col_suffix = "_nW"
+    else:
+        raise ValueError(
+            "Could not find background column. Expected 'background_uW' or 'bg_nW'."
+        )
+
+    powers = []
+    for b in range(8):
+        col = f"bit{b}{col_suffix}"
+        if col not in df.columns:
+            raise ValueError(f"Column '{col}' missing in {meas_path}")
+        p_raw = float(row[col]) * unit_factor
+        p = p_raw - background * unit_factor
+        powers.append(max(p, 0.0))
+
+    return np.array(powers, dtype=float)
+
+
+
 # ====== Bitmask targets (anchored at MSB) ======
+def compute_bitmask_currents_from_calibration(
+    cal: LedCalibration,
+    num_bits: int = 8,
+    anchor_current_pct: float = 100.0,
+) -> np.ndarray:
+    """
+    Given a calibration curve (current→power), choose num_bits currents
+    such that the powers form a perfect binary ladder anchored at the
+    power obtained at anchor_current_pct.
+
+    Returns array of length num_bits ordered LSB→MSB.
+    """
+    I_cal = np.array(cal.currents_pct, dtype=float)
+    P_cal = np.array(cal.powers_uW, dtype=float)
+
+    # Interpolate calibration power at the anchor current (e.g. 100 %)
+    P_anchor = np.interp(anchor_current_pct, I_cal, P_cal)
+
+    B = num_bits
+    exponents = np.arange(B) - (B - 1)  # so MSB exponent=0
+    P_targets = P_anchor * (2.0 ** exponents)  # LSB..MSB
+
+    I_targets = np.array(
+        [interpolate_current_from_power(I_cal, P_cal, P_t) for P_t in P_targets],
+        dtype=float,
+    )
+    return I_targets  # LSB→MSB
+
+def write_rgb_gbuv_suggested_from_calibration(
+    assets_dir: str,
+    cal_csv: str = "LEDcurrent_power.csv",
+    rgb_out: str = "RGB_suggested.csv",
+    gbuv_out: str = "GBUV_suggested.csv",
+    num_bits: int = 8,
+    anchor_current_pct: float = 100.0,
+) -> tuple[str, str]:
+    """
+    Use LEDcurrent_power.csv to generate bitmask currents and write
+    RGB_suggested.csv and GBUV_suggested.csv into assets_dir.
+
+    These are in the same layout as the example files you attached:
+    8 groups of 3 rows (MSB→LSB).
+    """
+    assets_dir = os.path.abspath(assets_dir)
+    os.makedirs(assets_dir, exist_ok=True)
+
+    cal_path = os.path.join(assets_dir, cal_csv)
+    cal_dict = load_led_calibrations_from_csv(cal_path)
+
+    red_cal   = cal_dict["Red"]
+    green_cal = cal_dict["Green"]
+    blue_cal  = cal_dict["Blue"]
+    uv_cal    = cal_dict["UV"]
+
+    # LSB→MSB currents from calibration alone
+    I_red   = compute_bitmask_currents_from_calibration(red_cal,   num_bits, anchor_current_pct)
+    I_green = compute_bitmask_currents_from_calibration(green_cal, num_bits, anchor_current_pct)
+    I_blue  = compute_bitmask_currents_from_calibration(blue_cal,  num_bits, anchor_current_pct)
+    I_uv    = compute_bitmask_currents_from_calibration(uv_cal,    num_bits, anchor_current_pct)
+
+    # Prepare empty DataFrames: 8 bits * 3 LEDs = 24 rows
+    total_rows = num_bits * 3
+
+    rgb_df = pd.DataFrame({
+        "LED #":          np.zeros(total_rows, dtype=int),
+        "LED PWM (%)":    np.full(total_rows, 100, dtype=int),
+        "LED current (%)": np.zeros(total_rows, dtype=float),
+        "Duration (s)":   np.zeros(total_rows, dtype=int),
+    })
+
+    gbuv_df = rgb_df.copy()
+
+    # Fill from MSB→LSB, but our arrays are LSB→MSB
+    B = num_bits
+    for b in range(B):  # b = 0..7 (LSB..MSB)
+        row_base = (B - 1 - b) * 3  # MSB block starts at row 0
+
+        # --- RGB: LED 4=Red, 3=Green, 2=Blue ---
+        rgb_df.loc[row_base,     "LED #"] = 4
+        rgb_df.loc[row_base + 1, "LED #"] = 3
+        rgb_df.loc[row_base + 2, "LED #"] = 2
+
+        rgb_df.loc[row_base,     "LED current (%)"] = I_red[b]
+        rgb_df.loc[row_base + 1, "LED current (%)"] = I_green[b]
+        rgb_df.loc[row_base + 2, "LED current (%)"] = I_blue[b]
+
+        # --- GBUV: LED 3=Green, 2=Blue, 1=UV ---
+        gbuv_df.loc[row_base,     "LED #"] = 3
+        gbuv_df.loc[row_base + 1, "LED #"] = 2
+        gbuv_df.loc[row_base + 2, "LED #"] = 1
+
+        gbuv_df.loc[row_base,     "LED current (%)"] = I_green[b]
+        gbuv_df.loc[row_base + 1, "LED current (%)"] = I_blue[b]
+        gbuv_df.loc[row_base + 2, "LED current (%)"] = I_uv[b]
+
+    rgb_path_out  = os.path.join(assets_dir, rgb_out)
+    gbuv_path_out = os.path.join(assets_dir, gbuv_out)
+
+    rgb_df.to_csv(rgb_path_out, index=False)
+    gbuv_df.to_csv(gbuv_path_out, index=False)
+
+    print(f"[LED calibration] Wrote {rgb_path_out}")
+    print(f"[LED calibration] Wrote {gbuv_path_out}")
+
+    return rgb_path_out, gbuv_path_out
+
 
 def compute_bit_targets(
     powers_uW: np.ndarray,
@@ -164,6 +420,100 @@ def linearize_led_bitmasks(
     return P_target, I_new, ratio
 
 
+def update_suggested_from_measurements(
+    assets_dir: str,
+    cal_csv: str,
+    meas_csv: str,
+    mode: str = "both",
+    num_bits: int = 8,
+    anchor_index: int = -1,
+    rgb_suggested: str = "RGB_suggested.csv",
+    gbuv_suggested: str = "GBUV_suggested.csv",
+):
+    """
+    Given:
+      - LED calibration curves (LEDcurrent_power.csv)
+      - current suggested RGB/GBUV CSVs
+      - measured bit-plane powers in meas_csv
+
+    compute new currents for each bit and overwrite the *_suggested.csv
+    files (LED current (%) column only).
+
+    mode: "rgb", "gbuv", or "both".
+    """
+    assets_dir = os.path.abspath(assets_dir)
+    cal_dict = load_led_calibrations_from_csv(os.path.join(assets_dir, cal_csv))
+
+    # ===== RGB =====
+    if mode.lower() in ("rgb", "both"):
+        rgb_path = os.path.join(assets_dir, rgb_suggested)
+        I_red_old, I_green_old, I_blue_old = load_currents_from_rgb_suggested(rgb_path, num_bits)
+
+        bitmasks = np.array([1, 2, 4, 8, 16, 32, 64, 128], dtype=int)
+
+        P_red_meas   = load_bitmask_powers_from_csv(meas_csv, "Red")
+        P_green_meas = load_bitmask_powers_from_csv(meas_csv, "Green")
+        P_blue_meas  = load_bitmask_powers_from_csv(meas_csv, "Blue")
+
+        red_bits = BitmaskChannelData("Red",   bitmasks, I_red_old,   P_red_meas)
+        green_bits = BitmaskChannelData("Green", bitmasks, I_green_old, P_green_meas)
+        blue_bits = BitmaskChannelData("Blue",  bitmasks, I_blue_old,  P_blue_meas)
+
+        _, I_red_new, _   = linearize_led_bitmasks(cal_dict["Red"],   red_bits,   anchor_index=anchor_index)
+        _, I_green_new, _ = linearize_led_bitmasks(cal_dict["Green"], green_bits, anchor_index=anchor_index)
+        _, I_blue_new, _  = linearize_led_bitmasks(cal_dict["Blue"],  blue_bits,  anchor_index=anchor_index)
+
+        # overwrite currents in RGB_suggested.csv
+        df_rgb = pd.read_csv(rgb_path)
+        B = num_bits
+        for b in range(B):
+            row_base = (B - 1 - b) * 3
+            for k in range(3):
+                idx = row_base + k
+                led = int(df_rgb.loc[idx, "LED #"])
+                if led == 4:
+                    df_rgb.loc[idx, "LED current (%)"] = I_red_new[b]
+                elif led == 3:
+                    df_rgb.loc[idx, "LED current (%)"] = I_green_new[b]
+                elif led == 2:
+                    df_rgb.loc[idx, "LED current (%)"] = I_blue_new[b]
+        df_rgb.to_csv(rgb_path, index=False)
+        print(f"[LED calibration] Updated {rgb_path}")
+
+    # ===== GBUV =====
+    if mode.lower() in ("gbuv", "both"):
+        gbuv_path = os.path.join(assets_dir, gbuv_suggested)
+        I_green_old, I_blue_old, I_uv_old = load_currents_from_gbuv_suggested(gbuv_path, num_bits)
+
+        bitmasks = np.array([1, 2, 4, 8, 16, 32, 64, 128], dtype=int)
+
+        P_green_meas = load_bitmask_powers_from_csv(meas_csv, "Green")
+        P_blue_meas  = load_bitmask_powers_from_csv(meas_csv, "Blue")
+        P_uv_meas    = load_bitmask_powers_from_csv(meas_csv, "UV")
+
+        green_bits = BitmaskChannelData("Green", bitmasks, I_green_old, P_green_meas)
+        blue_bits  = BitmaskChannelData("Blue",  bitmasks, I_blue_old,  P_blue_meas)
+        uv_bits    = BitmaskChannelData("UV",    bitmasks, I_uv_old,    P_uv_meas)
+
+        _, I_green_new, _ = linearize_led_bitmasks(cal_dict["Green"], green_bits, anchor_index=anchor_index)
+        _, I_blue_new, _  = linearize_led_bitmasks(cal_dict["Blue"],  blue_bits,  anchor_index=anchor_index)
+        _, I_uv_new, _    = linearize_led_bitmasks(cal_dict["UV"],    uv_bits,    anchor_index=anchor_index)
+
+        df_gbuv = pd.read_csv(gbuv_path)
+        B = num_bits
+        for b in range(B):
+            row_base = (B - 1 - b) * 3
+            for k in range(3):
+                idx = row_base + k
+                led = int(df_gbuv.loc[idx, "LED #"])
+                if led == 3:
+                    df_gbuv.loc[idx, "LED current (%)"] = I_green_new[b]
+                elif led == 2:
+                    df_gbuv.loc[idx, "LED current (%)"] = I_blue_new[b]
+                elif led == 1:
+                    df_gbuv.loc[idx, "LED current (%)"] = I_uv_new[b]
+        df_gbuv.to_csv(gbuv_path, index=False)
+        print(f"[LED calibration] Updated {gbuv_path}")
 
 # ====== Printing helpers: RGB and GBUV formats ======
 
@@ -262,266 +612,70 @@ def plot_bitmask_currents(bit_data: BitmaskChannelData,
     plt.grid(True)
 
 
-def compute_linearized_defaults():
-    """
-    Reproduce the hard-coded example from __main__ but return the
-    linearized bit currents for R, G, B, UV instead of just plotting/printing.
 
-    Returns
-    -------
-    I_new_red, I_new_green, I_new_blue, I_new_uv : np.ndarray
-        Each is length 8, ordered LSB→MSB (bitmasks 1,2,...,128).
-    """
-    # Calibration currents (%)
-    currents = np.array(
-        [2.8, 3, 3.25, 3.5, 4, 5, 6, 7, 8, 9,
-         10, 12, 15, 20, 30, 40, 50, 60, 80, 100],
-        dtype=float
-    )
-
-    # Calibration powers (µW) for each channel
-    red_cal_p = np.array(
-        [0.00017, 0.00039, 0.00070, 0.00099, 0.00157,
-         0.00279, 0.00404, 0.00530, 0.00655, 0.00778,
-         0.00905, 0.01175, 0.01560, 0.02177, 0.03429,
-         0.04642, 0.05719, 0.06700, 0.08487, 0.10100]
-    )
-    green_cal_p = np.array(
-        [0.00015, 0.00032, 0.00057, 0.00081, 0.00128,
-         0.00221, 0.00315, 0.00408, 0.00499, 0.00588,
-         0.00676, 0.00849, 0.01111, 0.01498, 0.02263,
-         0.02922, 0.03562, 0.04138, 0.05238, 0.06180]
-    )
-    blue_cal_p = np.array(
-        [0.00021, 0.00047, 0.00084, 0.00119, 0.00187,
-         0.00326, 0.00469, 0.00599, 0.00739, 0.00863,
-         0.00997, 0.01240, 0.01608, 0.02175, 0.03201,
-         0.04125, 0.04986, 0.05727, 0.07063, 0.08220]
-    )
-    uv_cal_p = np.array(
-        [0.00069, 0.00161, 0.00290, 0.00410, 0.00650,
-         0.01153, 0.01673, 0.02177, 0.02725, 0.03228,
-         0.03747, 0.04755, 0.06267, 0.08785, 0.13690,
-         0.18476, 0.23084, 0.27588, 0.36601, 0.44750]
-    )
-
-    red_cal = LedCalibration("Red", currents, red_cal_p)
-    green_cal = LedCalibration("Green", currents, green_cal_p)
-    blue_cal = LedCalibration("Blue", currents, blue_cal_p)
-    uv_cal = LedCalibration("UV", currents, uv_cal_p)
-
-    # Bitmask definitions (LSB -> MSB)
-    bitmasks = np.array([1, 2, 4, 8, 16, 32, 64, 128], dtype=int)
-
-    # Experiment-mode bit currents (%), in ascending bit order (1..128)
-    red_curr = np.array([3.329, 4.004, 5.288, 7.807, 12.671, 22.763, 43.741, 99.876])
-    green_curr = np.array([3.164, 3.664, 4.695, 6.757, 11.101, 20.587, 42.541, 99.788])
-    blue_curr = np.array([3.114, 3.571, 4.501, 6.344, 10.251, 18.941, 39.835, 99.983])
-    uv_curr = np.array([3.374, 4.097, 5.472, 8.142, 13.662, 24.894, 48.451, 99.975])
-
-    # Experiment-mode powers per bit (µW), ascending bit order
-    red_p_exp = np.array([0.40, 0.70, 1.40, 2.80, 5.50, 11.10, 22.50, 52.00])
-    green_p_exp = np.array([0.20, 0.30, 0.50, 0.80, 1.50, 3.10, 6.50, 13.70])
-    blue_p_exp = np.array([0.10, 0.10, 0.40, 0.70, 1.40, 2.90, 5.60, 11.30])
-    uv_p_exp = np.array([0.10, 0.10, 0.20, 0.30, 0.60, 1.20, 2.30, 4.50])
-
-    red_bits   = BitmaskChannelData("Red",   bitmasks, red_curr,   red_p_exp)
-    green_bits = BitmaskChannelData("Green", bitmasks, green_curr, green_p_exp)
-    blue_bits  = BitmaskChannelData("Blue",  bitmasks, blue_curr,  blue_p_exp)
-    uv_bits    = BitmaskChannelData("UV",    bitmasks, uv_curr,    uv_p_exp)
-
-    # Linearize each channel (anchor MSB = last index)
-    _, I_new_red, _   = linearize_led_bitmasks(red_cal,   red_bits,   anchor_index=-1)
-    _, I_new_green, _ = linearize_led_bitmasks(green_cal, green_bits, anchor_index=-1)
-    _, I_new_blue, _  = linearize_led_bitmasks(blue_cal,  blue_bits,  anchor_index=-1)
-    _, I_new_uv, _    = linearize_led_bitmasks(uv_cal,    uv_bits,    anchor_index=-1)
-
-    return I_new_red, I_new_green, I_new_blue, I_new_uv
-
-def export_linearized_to_csv(
-    assets_dir: str,
-    rgb_template: str = "RGB.csv",
-    gbuv_template: str = "GBUV.csv",
-    rgb_out: str = "RGB_suggested.csv",
-    gbuv_out: str = "GBUV_suggested.csv",
-) -> tuple[str, str]:
-    """
-    Use the default calibration + experiment data to compute linearized
-    bit-plane currents, then write new RGB/GBUV CSVs in the same layout
-    as the templates located in `assets_dir`.
-
-    Parameters
-    ----------
-    assets_dir : str
-        Folder containing RGB.csv and GBUV.csv (original template files).
-    rgb_template, gbuv_template : str
-        Template filenames inside assets_dir.
-    rgb_out, gbuv_out : str
-        Output filenames to write inside assets_dir.
-
-    Returns
-    -------
-    (rgb_path_out, gbuv_path_out) : tuple[str, str]
-        Full paths to the written CSV files.
-    """
-    assets_dir = os.path.abspath(assets_dir)
-    os.makedirs(assets_dir, exist_ok=True)
-
-    rgb_path_in  = os.path.join(assets_dir, rgb_template)
-    gbuv_path_in = os.path.join(assets_dir, gbuv_template)
-
-    if not os.path.exists(rgb_path_in):
-        raise FileNotFoundError(f"RGB template not found: {rgb_path_in}")
-    if not os.path.exists(gbuv_path_in):
-        raise FileNotFoundError(f"GBUV template not found: {gbuv_path_in}")
-
-    rgb_df  = pd.read_csv(rgb_path_in)
-    gbuv_df = pd.read_csv(gbuv_path_in)
-
-    I_new_red, I_new_green, I_new_blue, I_new_uv = compute_linearized_defaults()
-
-    # Both CSVs are laid out as 8 groups of 3 rows (MSB → LSB).
-    # Our I_new_* arrays are LSB → MSB, so we reverse the mapping.
-    B = len(I_new_red)
-    if B != 8:
-        raise ValueError(f"Expected 8 bits; got {B}")
-
-    rgb_df = rgb_df.copy()
-    gbuv_df = gbuv_df.copy()
-
-    # --- RGB: LED 4=Red, LED 3=Green, LED 2=Blue ---
-    for b in range(B):  # b = 0..7 (LSB..MSB)
-        row_base = (B - 1 - b) * 3  # MSB group starts at row 0
-        rgb_df.loc[row_base,     "LED current (%)"] = I_new_red[b]
-        rgb_df.loc[row_base + 1, "LED current (%)"] = I_new_green[b]
-        rgb_df.loc[row_base + 2, "LED current (%)"] = I_new_blue[b]
-
-    # --- GBUV: LED 3=Green, LED 2=Blue, LED 1=UV ---
-    for b in range(B):  # b = 0..7
-        row_base = (B - 1 - b) * 3
-        gbuv_df.loc[row_base,     "LED current (%)"] = I_new_green[b]
-        gbuv_df.loc[row_base + 1, "LED current (%)"] = I_new_blue[b]
-        gbuv_df.loc[row_base + 2, "LED current (%)"] = I_new_uv[b]
-
-    rgb_path_out  = os.path.join(assets_dir, rgb_out)
-    gbuv_path_out = os.path.join(assets_dir, gbuv_out)
-
-    rgb_df.to_csv(rgb_path_out, index=False)
-    gbuv_df.to_csv(gbuv_path_out, index=False)
-
-    print(f"[LED calibration] Wrote {rgb_path_out}")
-    print(f"[LED calibration] Wrote {gbuv_path_out}")
-
-    return rgb_path_out, gbuv_path_out
-
-# ====== Main: define your data and run everything ======
+# ====== Main CLI ======
 
 if __name__ == "__main__":
-    # Calibration currents (%)
-    currents = np.array(
-        [2.8, 3, 3.25, 3.5, 4, 5, 6, 7, 8, 9,
-         10, 12, 15, 20, 30, 40, 50, 60, 80, 100],
-        dtype=float
+    import argparse
+
+    parser = argparse.ArgumentParser(description="LED/DLP calibration helper")
+
+    parser.add_argument(
+        "--assets-dir",
+        type=str,
+        default="assets",  # <-- matches OpsinActivationGUI/assets
+        help="Folder containing LEDcurrent_power.csv, LEDbitpower.csv, etc.",
     )
 
-    # Calibration powers (µW) for each channel
-    red_cal_p = np.array(
-        [0.00017, 0.00039, 0.00070, 0.00099, 0.00157,
-         0.00279, 0.00404, 0.00530, 0.00655, 0.00778,
-         0.00905, 0.01175, 0.01560, 0.02177, 0.03429,
-         0.04642, 0.05719, 0.06700, 0.08487, 0.10100]
-    )
-    green_cal_p = np.array(
-        [0.00015, 0.00032, 0.00057, 0.00081, 0.00128,
-         0.00221, 0.00315, 0.00408, 0.00499, 0.00588,
-         0.00676, 0.00849, 0.01111, 0.01498, 0.02263,
-         0.02922, 0.03562, 0.04138, 0.05238, 0.06180]
-    )
-    blue_cal_p = np.array(
-        [0.00021, 0.00047, 0.00084, 0.00119, 0.00187,
-         0.00326, 0.00469, 0.00599, 0.00739, 0.00863,
-         0.00997, 0.01240, 0.01608, 0.02175, 0.03201,
-         0.04125, 0.04986, 0.05727, 0.07063, 0.08220]
-    )
-    uv_cal_p = np.array(
-        [0.00069, 0.00161, 0.00290, 0.00410, 0.00650,
-         0.01153, 0.01673, 0.02177, 0.02725, 0.03228,
-         0.03747, 0.04755, 0.06267, 0.08785, 0.13690,
-         0.18476, 0.23084, 0.27588, 0.36601, 0.44750]
+    parser.add_argument(
+        "--cal-csv",
+        type=str,
+        default="LEDcurrent_power.csv",
+        help="Calibration CSV filename inside assets-dir.",
     )
 
-    red_cal = LedCalibration("Red", currents, red_cal_p)
-    green_cal = LedCalibration("Green", currents, green_cal_p)
-    blue_cal = LedCalibration("Blue", currents, blue_cal_p)
-    uv_cal = LedCalibration("UV", currents, uv_cal_p)
+    parser.add_argument(
+        "--meas",
+        type=str,
+        default="LEDbitpower.csv",  # <-- your measurement file
+        help="Measurement CSV filename (relative to assets-dir).",
+    )
 
-    # Bitmask definitions (LSB -> MSB)
-    bitmasks = np.array([1, 2, 4, 8, 16, 32, 64, 128], dtype=int)
+    parser.add_argument(
+        "--mode",
+        type=str,
+        default="both",
+        choices=["rgb", "gbuv", "both"],
+        help="Which LED sets to update when using --update-from-measurements.",
+    )
 
-    # Experiment-mode bit currents (%), in ascending bit order (1..128)
-    red_curr = np.array([3.329, 4.004, 5.288, 7.807, 12.671, 22.763, 43.741, 99.876])
-    green_curr = np.array([3.164, 3.664, 4.695, 6.757, 11.101, 20.587, 42.541, 99.788])
-    blue_curr = np.array([3.114, 3.571, 4.501, 6.344, 10.251, 18.941, 39.835, 99.983])
-    uv_curr = np.array([3.374, 4.097, 5.472, 8.142, 13.662, 24.894, 48.451, 99.975])
+    parser.add_argument(
+        "--init-from-calibration",
+        action="store_true",
+        help="Generate RGB_suggested.csv and GBUV_suggested.csv from LEDcurrent_power.csv only.",
+    )
 
-    # Experiment-mode powers per bit (µW), ascending bit order
-    red_p_exp = np.array([0.40, 0.70, 1.40, 2.80, 5.50, 11.10, 22.50, 52.00])
-    green_p_exp = np.array([0.20, 0.30, 0.50, 0.80, 1.50, 3.10, 6.50, 13.70])
-    blue_p_exp = np.array([0.10, 0.10, 0.40, 0.70, 1.40, 2.90, 5.60, 11.30])
-    uv_p_exp = np.array([0.10, 0.10, 0.20, 0.30, 0.60, 1.20, 2.30, 4.50])
+    parser.add_argument(
+        "--update-from-measurements",
+        action="store_true",
+        help="Update *_suggested.csv based on LEDbitpower.csv measurements.",
+    )
 
-    red_bits = BitmaskChannelData("Red", bitmasks, red_curr, red_p_exp)
-    green_bits = BitmaskChannelData("Green", bitmasks, green_curr, green_p_exp)
-    blue_bits = BitmaskChannelData("Blue", bitmasks, blue_curr, blue_p_exp)
-    uv_bits = BitmaskChannelData("UV", bitmasks, uv_curr, uv_p_exp)
+    args = parser.parse_args()
+    assets_dir = os.path.abspath(args.assets_dir)
 
-    # Linearize each channel (anchor MSB = last index)
-    _, I_new_red, _ = linearize_led_bitmasks(red_cal, red_bits, anchor_index=-1)
-    _, I_new_green, _ = linearize_led_bitmasks(green_cal, green_bits, anchor_index=-1)
-    _, I_new_blue, _ = linearize_led_bitmasks(blue_cal, blue_bits, anchor_index=-1)
-    _, I_new_uv, _ = linearize_led_bitmasks(uv_cal, uv_bits, anchor_index=-1)
+    if args.init_from_calibration:
+        write_rgb_gbuv_suggested_from_calibration(
+            assets_dir=assets_dir,
+            cal_csv=args.cal_csv,
+        )
 
-    # --- Plot calibration fits for each LED ---
-    plot_calibration_curve(red_cal)
-    plot_calibration_curve(green_cal)
-    plot_calibration_curve(blue_cal)
-    plot_calibration_curve(uv_cal)
-
-    # --- Plot bitmask powers and currents for each LED ---
-    # Red
-    P_target_red, _, _ = linearize_led_bitmasks(red_cal, red_bits, anchor_index=-1)
-    plot_bitmask_powers(red_bits, P_target_red, title_suffix="(Red)")
-    plot_bitmask_currents(red_bits, I_new_red, title_suffix="(Red)")
-
-    # Green
-    P_target_green, _, _ = linearize_led_bitmasks(green_cal, green_bits, anchor_index=-1)
-    plot_bitmask_powers(green_bits, P_target_green, title_suffix="(Green)")
-    plot_bitmask_currents(green_bits, I_new_green, title_suffix="(Green)")
-
-    # Blue
-    P_target_blue, _, _ = linearize_led_bitmasks(blue_cal, blue_bits, anchor_index=-1)
-    plot_bitmask_powers(blue_bits, P_target_blue, title_suffix="(Blue)")
-    plot_bitmask_currents(blue_bits, I_new_blue, title_suffix="(Blue)")
-
-    # UV
-    P_target_uv, _, _ = linearize_led_bitmasks(uv_cal, uv_bits, anchor_index=-1)
-    plot_bitmask_powers(uv_bits, P_target_uv, title_suffix="(UV)")
-    plot_bitmask_currents(uv_bits, I_new_uv, title_suffix="(UV)")
-
-    # Finally, show all figures
-    plt.show()
-
-    # Print in RGB format (LED 4=Red, 3=Green, 2=Blue)
-    print("=== RGB format (4=Red, 3=Green, 2=Blue) ===")
-    print_rgb_table(I_new_red, I_new_green, I_new_blue)
-
-    print()  # blank line
-
-    # Print in GBUV format (LED 3=Green, 2=Blue, 1=UV)
-    print("=== GBUV format (3=Green, 2=Blue, 1=UV) ===")
-    print_gbuv_table(I_new_green, I_new_blue, I_new_uv)
-
-
-
+    if args.update_from_measurements:
+        update_suggested_from_measurements(
+            assets_dir=assets_dir,
+            cal_csv=args.cal_csv,
+            meas_csv=os.path.join(assets_dir, args.meas),
+            mode=args.mode,
+        )
 
 

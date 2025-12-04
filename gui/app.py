@@ -5,6 +5,7 @@ from opsinlab.activation import isolation_pipeline, compute_midgray_and_amplitud
 from gui.widgets.controls import Controls
 from gui.widgets.plots import Plots
 from opsinlab.activation import opsin_weighted_isomerizations
+from gui.widgets.plots import Plots, _led_set_code
 
 import numpy as np
 import os
@@ -192,6 +193,20 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             print("[R*/s per opsin]", {k: f"{v:.2e}" for k, v in iso_rates["Rstar_per_opsin"].items()})
 
+            # Extract per-opsin R*/s and a single rod R* value for the summary tab
+            rstar_dict = iso_rates.get("Rstar_per_opsin") or {}
+            opsin_rstars = dict(rstar_dict) if isinstance(rstar_dict, dict) else {}
+
+            rod_rstar = None
+            # Try common rod labels in order
+            for key in ("Rh", "Rho", "Rod"):
+                if key in rstar_dict:
+                    try:
+                        rod_rstar = float(rstar_dict[key])
+                    except Exception:
+                        rod_rstar = None
+                    break
+
             # cache & enable save button
             self._last_out = out | {"iso_rates": iso_rates}
             self.controls.save_btn.setEnabled(True)
@@ -216,9 +231,43 @@ class MainWindow(QtWidgets.QMainWindow):
                 selected_leds=leds,
                 species=species,
             )
+
+            # --- Build isolating LED vectors for the Summary tab ---
+            iso_vectors = {}
+            if mods is not None and not mods.empty:
+                leds_all = list(mods.index)
+                # Use the current trio order if possible; otherwise fall back to whatever is in the table
+                leds3 = [L for L in leds if L in leds_all]
+                if not leds3:
+                    leds3 = leds_all
+
+                code = _led_set_code(leds3)  # e.g. "RGB", "RGUV", "GBUV"
+
+                for col in mods.columns:
+                    # columns are like "LW_isolating", "MW_isolating", etc.
+                    try:
+                        vec = [float(mods.loc[L, col]) for L in leds3]
+                    except Exception:
+                        continue
+                    ops_name = col.replace("_isolating", "")
+                    # Label includes opsin + LED set, e.g. "LW (RGB)"
+                    label = f"{ops_name} ({code})"
+                    iso_vectors[label] = vec
+
+
             # push mid-gray readout
             if hasattr(self.plots, "set_midgray"):
                 self.plots.set_midgray(mid, gamma_global)
+
+            # --- Update Summary tab (if present) ---
+            if hasattr(self.plots, "update_summary"):
+                self.plots.update_summary(
+                    rod_rstar=rod_rstar,
+                    opsin_rstars=opsin_rstars,
+                    photon_flux_df=pf,
+                    selected_leds=leds,
+                    iso_vectors=iso_vectors,
+                )
 
             # also echo to status bar so you always see a readout
             sb_text = self._format_iso_summary(iso_rates)

@@ -18,6 +18,12 @@ OPSIN_COLORS = {
     "UVS": "purple",    # mouse UV-sensitive
 }
 
+# ===== Summary-tab constants (must be above the class) =====
+SCOTOPIC_MAX = 1e2
+MESOPIC_MAX  = 1e4
+RSTAR_MIN    = 1e0
+RSTAR_MAX    = 1e8
+
 # ---------- helpers ----------
 def _ordered_leds(leds):
     """Return LEDs ordered longest → shortest wavelength."""
@@ -433,21 +439,180 @@ class _IsolationTab(QtWidgets.QWidget):
         return (contrast, A_gray, beta_eff)
 
 
+class _SummaryTab(QtWidgets.QWidget):
+    """
+    Summary dashboard:
+      - Top: R*/rod/s along scotopic/mesopic/photopic range with a single point.
+      - Bottom: copyable text with per-opsin R*, per-LED photon totals, and isolation vectors.
+    """
+    def __init__(self):
+        super().__init__()
+
+        self.fig = Figure(constrained_layout=False)
+        self.ax = self.fig.add_subplot(111)
+        self.canvas = FigureCanvas(self.fig)
+        self.canvas.setFixedHeight(140)
+
+        title = QtWidgets.QLabel("<b>Light level summary</b>")
+        self.text = QtWidgets.QPlainTextEdit()
+        self.text.setReadOnly(True)
+        self.text.setMinimumHeight(200)
+
+        v = QtWidgets.QVBoxLayout(self)
+        v.addWidget(title)
+        v.addWidget(self.canvas)
+        v.addWidget(self.text)
+
+        # initial empty plot
+        self._draw_rstar_scale(current_rstar=None)
+
+    # ---- plotting ----
+    def _draw_rstar_scale(self, current_rstar: float | None):
+        ax = self.ax
+        ax.clear()
+
+        ax.set_xscale("log")
+        ax.set_xlim(RSTAR_MIN, RSTAR_MAX)
+
+        # Extra headroom for labels above the strip
+        ax.set_ylim(0.0, 0.8)
+        ax.get_yaxis().set_visible(False)
+
+        # Distinct shading per regime
+        ax.axvspan(
+            RSTAR_MIN, SCOTOPIC_MAX,
+            facecolor="#c7e3ff", alpha=0.8
+        )
+        ax.axvspan(
+            SCOTOPIC_MAX, MESOPIC_MAX,
+            facecolor="#dddddd", alpha=0.8
+        )
+        ax.axvspan(
+            MESOPIC_MAX, RSTAR_MAX,
+            facecolor="#ffe8b2", alpha=0.8
+        )
+
+        # Region labels centered above each shaded band (geometric mean on log axis)
+        centers = [
+            (np.sqrt(RSTAR_MIN * SCOTOPIC_MAX), "Scotopic"),
+            (np.sqrt(SCOTOPIC_MAX * MESOPIC_MAX), "Mesopic"),
+            (np.sqrt(MESOPIC_MAX * RSTAR_MAX), "Photopic"),
+        ]
+        for x_center, name in centers:
+            ax.text(
+                x_center,
+                0.55,              # above the shaded strip
+                name,
+                ha="center",
+                va="bottom",
+                fontsize=8,
+            )
+
+        ax.set_xlabel("R* / rod / s")
+
+        # Current point + label
+        if current_rstar is not None and np.isfinite(current_rstar) and current_rstar > 0:
+            x = float(np.clip(current_rstar, RSTAR_MIN, RSTAR_MAX))
+            y_point = 0.25      # moved up a bit
+            y_label = y_point + 0.08  # slightly farther above the point
+
+            ax.scatter([x], [y_point], s=40, zorder=3, color="black")
+            ax.text(
+                x,
+                y_label,
+                f"{current_rstar:.2g} R*/rod/s",
+                rotation=0,          # horizontal
+                va="bottom",
+                ha="center",
+                fontsize=8,
+                zorder=4,
+            )
+
+        self.fig.tight_layout()
+        self.canvas.draw_idle()
+
+    # ---- public update API ----
+    def update_summary(
+        self,
+        rod_rstar: float | None,
+        opsin_rstars: dict | None,
+        led_totals: dict | None,
+        iso_vectors: dict | None,
+    ):
+        """
+        Parameters
+        ----------
+        rod_rstar : float or None
+            R* / rod / s for the current condition (used for the point on the axis).
+        opsin_rstars : dict[str, float]
+            e.g. {"Rh": 3.1e3, "LW": 1.2e3, ...}
+        led_totals : dict[str, float]
+            Output from _photon_flux_totals(...) (per-LED plus 'Sum').
+        iso_vectors : dict[str, iterable|str]
+            e.g. {"Rh_isolating": (1.0, -0.5, 0.22), "LW_isolating": (...), ...}
+        """
+        # 1) update the R* scale plot
+        self._draw_rstar_scale(rod_rstar)
+
+        # 2) build text block
+        lines: list[str] = []
+
+        # Isomerizations per opsin
+        if opsin_rstars:
+            lines.append("Isomerizations (R*/s):")
+            for name, val in sorted(opsin_rstars.items()):
+                try:
+                    v = float(val)
+                except Exception:
+                    continue
+                lines.append(f"  {name}: {v:.3g}")
+            lines.append("")
+
+        # Photon flux per LED
+        if led_totals:
+            lines.append("Photon flux per LED (photons/s/µm²):")
+            # Use only LED keys, skip 'Sum' in the loop
+            for led in sorted(k for k in led_totals.keys() if k != "Sum"):
+                v = led_totals.get(led)
+                if v is None or not np.isfinite(v):
+                    continue
+                lines.append(f"  {led}: {v:.3g}")
+            if "Sum" in led_totals and np.isfinite(led_totals["Sum"]):
+                lines.append(f"  Total: {led_totals['Sum']:.3g}")
+            lines.append("")
+
+        # Isolating vectors (comma-separated, copyable)
+        if iso_vectors:
+            lines.append("Isolating LED vectors (comma-separated):")
+            for label, vec in iso_vectors.items():
+                if isinstance(vec, str):
+                    csv_str = vec
+                else:
+                    try:
+                        csv_str = ", ".join(f"{float(x):.2f}" for x in vec)
+                    except Exception:
+                        csv_str = str(vec)
+                lines.append(f"  {label}: {csv_str}")
+
+        self.text.setPlainText("\n".join(lines))
 
 
 # ---------- Container ----------
 class Plots(QtWidgets.QTabWidget):
     def __init__(self):
         super().__init__()
+        self.tab_summary = _SummaryTab()
         self.tab_flux  = _PhotonFluxTab("Photon flux (selected LEDs)")
         self.tab_nomo  = _MplTab("Opsin nomograms")
         self.tab_act   = _ActTab("Activation matrix (LED × Opsin)")
         self.tab_iso   = _IsolationTab()
 
+        self.addTab(self.tab_summary, "Summary")
         self.addTab(self.tab_flux, "Photon Flux")
         self.addTab(self.tab_nomo, "Nomograms")
         self.addTab(self.tab_act,  "Activation")
         self.addTab(self.tab_iso,  "Isolation")
+
 
     # ---- Public entry point from controller ----
     def update_all(
@@ -463,6 +628,30 @@ class Plots(QtWidgets.QTabWidget):
         self._update_nomograms(nomograms_df, species)
         self._update_activation(activation_matrix)
         self.tab_iso.set_modulations(modulations_df, selected_leds, activation_matrix)
+
+    def update_summary(
+        self,
+        rod_rstar: float | None,
+        opsin_rstars: dict | None,
+        photon_flux_df,
+        selected_leds,
+        iso_vectors: dict | None,
+    ):
+        """
+        Convenience wrapper: computes LED totals from the photon_flux_df and
+        forwards everything to the Summary tab.
+        """
+        if photon_flux_df is None or photon_flux_df.empty or not selected_leds:
+            led_totals = None
+        else:
+            led_totals = _photon_flux_totals(photon_flux_df, selected_leds)
+
+        self.tab_summary.update_summary(
+            rod_rstar=rod_rstar,
+            opsin_rstars=opsin_rstars,
+            led_totals=led_totals,
+            iso_vectors=iso_vectors,
+        )
 
     def set_midgray(self, mid_df, gamma_global=None):
         if hasattr(self, "tab_iso"):

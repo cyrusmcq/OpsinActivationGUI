@@ -22,7 +22,7 @@ OPSIN_COLORS = {
 SCOTOPIC_MAX = 1e2
 MESOPIC_MAX  = 1e4
 RSTAR_MIN    = 1e0
-RSTAR_MAX    = 1e8
+RSTAR_MAX    = 1e6
 
 # ---------- helpers ----------
 def _ordered_leds(leds):

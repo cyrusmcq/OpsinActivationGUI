@@ -1,2 +1,21 @@
 *.csv
 assets/RGB.csv
+assets/RGB_suggested.csv
+assets/GBUV.csv
+assets/GBUV_suggested.csv
+
+# PyCharm
+.idea/
+*.iml
+
+# Virtual environment
+.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# OS files
+.DS_Store
+Thumbs.db

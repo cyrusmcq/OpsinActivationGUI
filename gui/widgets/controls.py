@@ -7,6 +7,7 @@ _LED_CONFIGS = {
     "GBUV": ["Green", "Blue", "UV"],
 }
 
+
 class Controls(QtWidgets.QWidget):
     # Public signals the MainWindow listens to
     paramsChanged = QtCore.pyqtSignal()
@@ -17,6 +18,12 @@ class Controls(QtWidgets.QWidget):
         super().__init__()
 
         v = QtWidgets.QVBoxLayout(self)
+
+        # --- Scope selection ---
+        v.addWidget(QtWidgets.QLabel("Scope"))
+        self.scope_combo = QtWidgets.QComboBox()
+        self.scope_combo.addItems(["Hyperscope", "MP2000"])
+        v.addWidget(self.scope_combo)
 
         # --- Species ---
         v.addWidget(QtWidgets.QLabel("Species"))
@@ -51,24 +58,18 @@ class Controls(QtWidgets.QWidget):
         self.exactinv_chk.setChecked(True)
         v.addWidget(self.exactinv_chk)
 
-        # === NEW: LED power calibration (date ranges) ===
+        # === LED power calibration (date ranges) ===
         v.addWidget(QtWidgets.QLabel("LED power calibration"))
         self.power_combo = QtWidgets.QComboBox()
-        # Keys are user-visible labels; app.py will map them to numbers
-        self.power_combo.addItems([
-            "Current",
-            "test",
-            "2025-04-30 – 2025-07-19",
-            "2024-11-06 – 2025-04-29",
-            "2024-06-05 – 2024-11-04",
-        ])
         self.power_combo.setToolTip("Sets R/G/B/UV power (nW) for a 250 µm spot")
         v.addWidget(self.power_combo)
 
-        #Recommend LED ratio button
+        # --- Recommend LED ratio button ---
         self.recommend_btn = QtWidgets.QPushButton("Recommend LED ratios")
-        self.recommend_btn.setToolTip("Compute suggested relative LED powers for current species/LED trio")
-        v.addWidget(self.recommend_btn)  # or add to your existing buttons row
+        self.recommend_btn.setToolTip(
+            "Compute suggested relative LED powers for current species/LED trio"
+        )
+        v.addWidget(self.recommend_btn)
         self.recommend_btn.clicked.connect(self.recommendRatiosClicked.emit)
 
         # --- Save button ---
@@ -78,7 +79,8 @@ class Controls(QtWidgets.QWidget):
 
         v.addStretch(1)
 
-        # --- Events (hook all widgets to one emitter) ---
+        # --- Events (hook all relevant widgets to one emitter) ---
+        self.scope_combo.currentIndexChanged.connect(self._emit_params_changed)
         self.species_combo.currentIndexChanged.connect(self._emit_params_changed)
         self.led_combo.currentIndexChanged.connect(self._emit_params_changed)
         self.nd_combo.currentIndexChanged.connect(self._emit_params_changed)
@@ -94,6 +96,9 @@ class Controls(QtWidgets.QWidget):
     def _emit_params_changed(self, *_):
         """Unify all control changes into a single signal."""
         self.paramsChanged.emit()
+
+    def current_scope(self) -> str:
+        return self.scope_combo.currentText()
 
     def current_species(self) -> str:
         return self.species_combo.currentText()

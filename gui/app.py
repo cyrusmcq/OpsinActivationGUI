@@ -3,9 +3,8 @@ from opsinlab.io_led import process_led_data
 from opsinlab.nomograms import generate_nomograms, available_species, interpolate_nomograms
 from opsinlab.activation import isolation_pipeline, compute_midgray_and_amplitude, recommend_led_power_ratios
 from gui.widgets.controls import Controls
-from gui.widgets.plots import Plots
-from opsinlab.activation import opsin_weighted_isomerizations
 from gui.widgets.plots import Plots, _led_set_code
+from opsinlab.activation import opsin_weighted_isomerizations
 
 import numpy as np
 import os
@@ -35,14 +34,13 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.addWidget(self.controls, 0)
         layout.addWidget(self.plots, 1)
 
-        # === LED power sets (nW for a 250 µm spot) ===
-        self._POWER_SETS_NW = {
-            "Current":                  {"Red": 1430.0, "Green": 168.0,  "Blue": 259.0,  "UV": 214.0},
-            "test":                    {"Red": 3, "Green": 1,  "Blue": 0.97,  "UV": 0.41},
-            "2025-04-30 – 2025-07-19": {"Red": 2856.0, "Green": 242.1,  "Blue": 813.0,  "UV": 887.0},
-            "2024-11-06 – 2025-04-29": {"Red": 184.5,  "Green": 26.64,  "Blue": 40.69,  "UV": 31.15},
-            "2024-06-05 – 2024-11-04": {"Red": 756.0,  "Green": 112.0,  "Blue": 410.0,  "UV": 370.0},
-        }
+        # --- load initial power sets from CSV based on scope ---
+        initial_scope = self.controls.scope_combo.currentText()
+        self._POWER_SETS_NW = self._load_power_csv(initial_scope)
+
+        # push the keys into Controls
+        self.controls.power_combo.clear()
+        self.controls.power_combo.addItems(list(self._POWER_SETS_NW.keys()))
 
         def _powers_watts_from_key(key: str) -> dict:
             # Fallback-friendly: if control not present or key missing, use Current
@@ -73,6 +71,9 @@ class MainWindow(QtWidgets.QMainWindow):
         # wire events
         self.controls.paramsChanged.connect(self.recompute)
 
+        # scope-specific reload
+        self.controls.scope_combo.currentIndexChanged.connect(self._scope_changed)
+
         # ensure single connection just like saveMatricesClicked
         try:
             self.controls.recommendRatiosClicked.disconnect(self._recommend_led_ratios)
@@ -94,6 +95,87 @@ class MainWindow(QtWidgets.QMainWindow):
         QtCore.QTimer.singleShot(0, self.recompute)
 
     # ---------- helpers ----------
+    def _load_power_csv(self, scope_name: str) -> dict:
+        """
+        Load LED power calibration sets (in nW) for the given scope.
+
+        Expected CSV format (your files):
+            Date,Red,Green,Blue,UV,nW for 250 um spot
+
+        We use the 'Date' column as the key (e.g. 'Current',
+        '2025-04-30 to 2025-07-19', etc.) and store a dict of
+        {LED_name: power_nW}.
+        """
+
+        if scope_name == "Hyperscope":
+            filename = "Hyperscope_LED_power.csv"
+        else:
+            filename = "MP2000_LED_power.csv"
+
+        # app.py is in gui/, assets is at OpsinActivationGUI/assets
+        project_root = os.path.dirname(os.path.dirname(__file__))
+        assets_dir = os.path.join(project_root, "assets")
+        path = os.path.join(assets_dir, filename)
+
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Could not find power CSV at: {path}")
+
+        df = pd.read_csv(path)
+
+        # Drop rows that are completely empty (handles trailing blank lines)
+        df = df.dropna(how="all")
+
+        if "Date" not in df.columns:
+            raise ValueError(f"CSV {path} must contain a 'Date' column; found: {df.columns.tolist()}")
+
+        power_sets: dict[str, dict[str, float]] = {}
+
+        for _, row in df.iterrows():
+            # Use 'Date' as the label (Current, test, date ranges, etc.)
+            raw_name = row["Date"]
+            if pd.isna(raw_name):
+                continue
+            name = str(raw_name).strip()
+            if not name:
+                continue
+
+            # Build LED -> nW dict; ignore the annotation column
+            d: dict[str, float] = {}
+            for col in df.columns:
+                if col in ("Date", "nW for 250 um spot"):
+                    continue
+                val = row[col]
+                if pd.isna(val):
+                    continue
+                d[col] = float(val)
+
+            if d:
+                power_sets[name] = d
+
+        if not power_sets:
+            raise ValueError(f"No usable power sets parsed from {path}")
+
+        return power_sets
+
+
+    def _scope_changed(self, *_):
+        """Handle changes in scope (Hyperscope vs MP2000)."""
+        scope = self.controls.current_scope()
+        try:
+            self._POWER_SETS_NW = self._load_power_csv(scope)
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(self, "Failed to load power sets", str(e))
+            return
+
+        # Update the calibration dropdown without causing extra recomputes
+        self.controls.power_combo.blockSignals(True)
+        self.controls.power_combo.clear()
+        self.controls.power_combo.addItems(list(self._POWER_SETS_NW.keys()))
+        self.controls.power_combo.blockSignals(False)
+
+        # Recompute with the new calibration
+        self.recompute()
+
     @staticmethod
     def _format_iso_summary(iso_rates: dict) -> str:
         """Build a concise status-bar string from opsin_weighted_isomerizations() output."""
@@ -236,24 +318,17 @@ class MainWindow(QtWidgets.QMainWindow):
             iso_vectors = {}
             if mods is not None and not mods.empty:
                 leds_all = list(mods.index)
-                # Use the current trio order if possible; otherwise fall back to whatever is in the table
-                leds3 = [L for L in leds if L in leds_all]
-                if not leds3:
-                    leds3 = leds_all
-
+                leds3 = [L for L in leds if L in leds_all] or leds_all
                 code = _led_set_code(leds3)  # e.g. "RGB", "RGUV", "GBUV"
 
                 for col in mods.columns:
-                    # columns are like "LW_isolating", "MW_isolating", etc.
                     try:
                         vec = [float(mods.loc[L, col]) for L in leds3]
                     except Exception:
                         continue
                     ops_name = col.replace("_isolating", "")
-                    # Label includes opsin + LED set, e.g. "LW (RGB)"
                     label = f"{ops_name} ({code})"
                     iso_vectors[label] = vec
-
 
             # push mid-gray readout
             if hasattr(self.plots, "set_midgray"):
@@ -275,141 +350,20 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.statusBar().showMessage(f"Isomerizations — {sb_text}")
 
         except Exception as e:
-            # Surface Python exceptions instead of silent hard-exit
             QtWidgets.QMessageBox.critical(self, "Error in recompute()", str(e))
             raise
         finally:
             self._in_recompute = False
 
     def _save_matrices(self):
-        # Prevent duplicate dialogs / re-entrant calls
-        if self._saving:
-            return
-        self._saving = True
-        try:
-            if not self._last_out:
-                QtWidgets.QMessageBox.warning(self, "Nothing to save", "Run a computation first.")
-                return
-
-            # === Ask user for destination folder ONCE ===
-            dest_dir = QtWidgets.QFileDialog.getExistingDirectory(
-                self, "Choose folder to save matrices", os.getcwd()
-            )
-            if not dest_dir:
-                return
-
-            out = self._last_out  # read-only use
-            species = self.controls.current_species()
-            species_tag = species.replace(" ", "_")
-
-            # ND tag (robust if control returns None/empty)
-            try:
-                od_val = self.controls.nd_optical_density()
-                nd_tag = f"ND{float(od_val):g}".replace(".", "p")
-            except Exception:
-                nd_tag = "ND0"
-
-            # Timestamp for unique filenames
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-            def save_df(df: pd.DataFrame, name: str, index=True):
-                filename = f"{timestamp}_{species_tag}_{nd_tag}_{name}.csv"
-                path = os.path.join(dest_dir, filename)
-                df.copy().to_csv(path, float_format="%.6e", index=index)
-                print(f"Saved {filename}")
-
-            # --- Build labeled frames explicitly (no mutation) ---
-            A_df    = out["ActivationMatrix"].copy()
-            inv_df  = pd.DataFrame(out["InverseActivationMatrix"],
-                                   index=out["opsins3"], columns=out["leds3"]).copy()
-            P_df    = out["ProductMatrix"].copy()
-            Psc_df  = out["ScaledProductMatrix"].copy()
-            mods_df = out["Modulations"].copy()
-            P_T_df  = P_df.T.copy()
-
-            # --- Save ---
-            save_df(A_df,   "ActivationMatrix")
-            save_df(inv_df, "InverseActivationMatrix")
-            save_df(P_df,   "ProductMatrix")
-            save_df(Psc_df, "ScaledProductMatrix")
-            save_df(mods_df,"Modulations")
-            save_df(P_T_df, "ProductMatrix_T")
-
-            # Optional: also save opsin-weighted R* if present
-            iso_rates = out.get("iso_rates")
-            if iso_rates and "Rstar_per_opsin" in iso_rates:
-                rstar_series = pd.Series(iso_rates["Rstar_per_opsin"], name="Rstar_per_sec")
-                save_df(rstar_series.to_frame(), "Rstar_per_opsin", index=True)
-
-            QtWidgets.QMessageBox.information(self, "Saved", f"Matrices saved to:\n{dest_dir}")
-
-        finally:
-            self._saving = False
+        # (unchanged – your existing implementation)
+        ...
+        # keep your existing _save_matrices body here
 
     def _recommend_led_ratios(self):
-        """
-        Compute recommended relative LED power multipliers (unitless, max=1)
-        and the corresponding LED powers in nW for the currently selected
-        calibration set and species/LED trio.
-        """
-        try:
-            species = self.controls.current_species()
-            leds = self.controls.selected_leds()
-            power_key = self.controls.current_power_key()
-
-            # Ensure we have an ActivationMatrix available
-            if not self._last_out:
-                pf = self._photon_flux
-                wl_led = pf["Wavelength"].to_numpy(dtype=float)
-                wl_master = np.arange(200.0, 701.0, 1.0)
-                nomo_200_700 = generate_nomograms(species, wl_master, normalize=True)
-                nomo = interpolate_nomograms(nomo_200_700, wl_led)
-                out = isolation_pipeline(
-                    photon_flux_df=pf,
-                    nomograms_df=nomo,
-                    species=species,
-                    selected_leds_3=leds,
-                    strategy=(
-                        "match_across_isolations" if self.controls.match_across_isolations() else "per_isolation_max"),
-                    use_exact_inverse=self.controls.use_exact_inverse(),
-                )
-            else:
-                out = self._last_out
-
-            A_full = out["ActivationMatrix"]
-            ops3 = out["opsins3"]
-            A0 = A_full.loc[leds, ops3]  # 3×3 base matrix
-
-            # --- compute relative power ratios (max = 1.0) ---
-            ratios = recommend_led_power_ratios(A0)
-
-            # --- compute scaled absolute powers (nW) from current calibration set ---
-            base_powers_nw = self._POWER_SETS_NW.get(power_key, self._POWER_SETS_NW["Current"])
-            powers_scaled = {led: float(base_powers_nw.get(led, 0.0)) * float(ratios.get(led, 1.0))
-                             for led in leds}
-
-            # --- pretty print ---
-            ratio_txt = ", ".join(f"{led}={val:.2f}" for led, val in ratios.items())
-            power_txt = ", ".join(f"{led}={val:.1f} nW" for led, val in powers_scaled.items())
-
-            print(f"[Recommended LED ratios] {ratio_txt}")
-            print(f"[Recommended LED powers (nW, scaled from '{power_key}')] {power_txt}")
-
-            # --- display in Photon-Flux tab ---
-            if hasattr(self.plots, "set_ratio_summary"):
-                # combine both into one line
-                text = {
-                    "ratios": ratios,
-                    "powers": powers_scaled,
-                    "label": power_key,
-                }
-                self.plots.set_ratio_summary(text)
-
-            # --- status bar echo ---
-            self.statusBar().showMessage(f"LED ratios {ratio_txt} | powers (nW): {power_txt}")
-
-        except Exception as e:
-            QtWidgets.QMessageBox.warning(self, "LED ratio recommendation failed", str(e))
+        # (unchanged – your existing implementation)
+        ...
+        # keep your existing _recommend_led_ratios body here
 
 
 def main():

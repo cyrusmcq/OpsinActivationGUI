@@ -87,7 +87,7 @@ A **Scope** dropdown in the GUI selects which file to use.
 
 ### CSV Format
 
-Each calibration file must follow this structure:
+Each calibration file must follow this structure*:
 
 ```csv
 Date,Red,Green,Blue,UV,nW for 250 um spot
@@ -101,6 +101,8 @@ Current,1430,168,259,214,
 * The final column is ignored (notes only)
 
 Add new calibrations by simply adding new rows.
+
+\*Update note 3-27-26: Implementation of single channel, broad spectrum light sources has been added and csvs for these light sources can have other column names. See assets->Rig1_OLED_power.csv
 
 ---
 
@@ -134,11 +136,13 @@ and select it using the GUI Scope dropdown.
 
 ---
 
-## Power Meter Correction
+## Power Meter Correction\*
 
 OpsinActivation compensates for the spectral responsivity of your powermeter.
 
 Many powermeters measure green light more efficiently than UV, which would otherwise distort relative LED calibration.
+
+\* This correction is only required if your power meter does not already perform wavelength-based calibration. Rig1 and AOSLO light sources were measured with calibration and added 3-27-26. Compare io_led.py and io_AOSLO.py for implementation.
 
 ### How Correction Works
 

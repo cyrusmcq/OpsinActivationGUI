@@ -186,6 +186,7 @@ corr = pd.DataFrame({
 
 ## Roadmap
 
+* Field size (for AOSLO) or stimulus size selectors for user-friendly power calibration
 * Parameter presets for common lab species
 * Extended plotting customization
 * Batch processing options

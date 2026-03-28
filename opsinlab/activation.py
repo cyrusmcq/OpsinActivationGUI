@@ -23,7 +23,7 @@ def _validate_columns(df: pd.DataFrame, need: List[str], df_name: str) -> None:
 
 def _canonicalize_flux_columns(photon_flux_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Return a copy where LED flux columns exist under canonical names: 'Red','Green','Blue','UV'.
+    Return a copy where LED flux columns exist under canonical names: 'Red','Green','Blue','UV', 'White'.
     Accepts either '*_PhotonFlux' or bare LED names. Non-present LEDs are ignored.
     """
     df = photon_flux_df.copy()
@@ -32,6 +32,7 @@ def _canonicalize_flux_columns(photon_flux_df: pd.DataFrame) -> pd.DataFrame:
         "Green_PhotonFlux": "Green",
         "Blue_PhotonFlux": "Blue",
         "UV_PhotonFlux": "UV",
+        "White_PhotonFlux": "White",
     }
     for src, dst in mapping.items():
         if src in df.columns and dst not in df.columns:
@@ -150,6 +151,7 @@ def scale_product_matrix(
 
 # ----------------------------- Species opsin sets -----------------------------
 _SPECIES_OPS3: Dict[str, List[str]] = {
+    "human:": ["LW", "MW", "SW"],
     "macaque": ["LW", "MW", "SW"],
     "mouse":   ["Rh", "MW", "UVS"],
     "guinea pig": ["Rh", "MW", "SW"],
@@ -179,10 +181,15 @@ COLLECTING_AREAS_BY_SPECIES: Dict[str, CollectingAreas] = {
     # Fain et al., F1000Research 2018 (10.12688/f1000research.14021.1)
     "Guinea Pig": CollectingAreas(rod=0.7, cone_MW=0.5, cone_SW=0.5),
 
-    # Macaque rods ~1.0 µm²; cones ~0.6 µm².
+    # Macaque rods ~1.0 µm²; cones ~0.6 µm² COLLECTING AREA, not outer segment area.
     # Baylor, Nunn & Schnapf, J Physiol 1984 (10.1113/jphysiol.1984.sp015518)
     # Schneeweis & Schnapf, J Physiol 1999 (PMCID: PMC6786037)
+    # "The number of photoisomerizations per flash was calculated from the product of the flash photon density and the photoreceptor collecting area. Except where noted, the collecting area was assumed to have peak values of 0.6 um2 for cones and 1 um2 for rods (Schneeweis and Schnapf, 1995), with corresponding values for 500 and 660 nm light of 0.312 and 4.14 x 10-2 (red cones), 0.542 and 4.02 x 10-3 (green cones), and 1.0 and 2.63 x 10-4 (rods). These values (in um2 ) were based on the action spectra measured with suction electrodes (Baylor et al., 1984, 1987; Kraft et al., 1993). The correction for photopigment self-screening that arises with axial illumination of the outer segment was made assuming that the peak axial optical density was 0.35 for rods and 0.17 for cones (Baylor et al., 1984; 1987). For comparison with psychophysical studies, it was assumed that 1 troland (td) at 560 nm corresponds to 14 photoisomerizations/sec-1 for red and green cones (Schnapf et al., 1990)."
     "Macaque": CollectingAreas(rod=1.0, cone_LW=0.6, cone_MW=0.6, cone_SW=0.6),
+
+    # Human cones ~12-15 µm² in periphery, ~2-3.5 µm² in fovea; rods ~3 µm² in periphery, not in fovea.
+    # Curcio et al THE JOURNAL OF COMPARATIVE NEUROLOGY 292:497-523 (1990) Human Photoreceptor Topography
+    "Human": CollectingAreas(rod=1.0, cone_LW=0.6, cone_MW=0.6, cone_SW=0.6),
 }
 
 # ----------------------------- Opsin-weighted isomerizations -----------------------------
@@ -298,10 +305,16 @@ def isolation_pipeline(
     """
     Returns a dict with:
       - ActivationMatrix (LED×Opsin, all opsins present in nomograms_df)
-      - InverseActivationMatrix (3×3)
-      - ProductMatrix (3×3, raw)
-      - ScaledProductMatrix (3×3, scaled)
-      - Modulations (3×3, same as ScaledProductMatrix but nicer column names)
+      - isolation_possible (bool): True if ≥3 LEDs, False otherwise
+      - InverseActivationMatrix (3×3, or None if isolation not possible)
+      - ProductMatrix (3×3, or None)
+      - ScaledProductMatrix (3×3, or None)
+      - Modulations (3×3, or None)
+
+    When fewer than 3 LEDs are provided (e.g. a single-channel OLED),
+    isolation is physically impossible.  The pipeline still computes the
+    ActivationMatrix (useful for R* calculations) but returns None for
+    all isolation-specific outputs and sets isolation_possible=False.
     """
     sp = species.strip().lower()
     ops3 = _SPECIES_OPS3.get(sp, ["LW", "MW", "SW"])
@@ -316,6 +329,22 @@ def isolation_pipeline(
         wl_min=wl_min, wl_max=wl_max
     )
 
+    # --- Single-channel sources (e.g. OLED): isolation is not possible ---
+    if len(selected_leds_3) < 3:
+        return {
+            "ActivationMatrix": A,
+            "isolation_possible": False,
+            "InverseActivationMatrix": None,
+            "ProductMatrix": None,
+            "ScaledProductMatrix": None,
+            "Modulations": None,
+            "opsins3": ops3,
+            "leds3": selected_leds_3,
+            "strategy": strategy,
+            "use_exact_inverse": use_exact_inverse,
+        }
+
+    # --- 3+ LEDs: full isolation math ---
     invM = inverse_activation_matrix(A, selected_leds_3, ops3, method=("inv" if use_exact_inverse else "pinv"))
     P = product_matrix_from_inverse(invM, ops3, selected_leds_3)
     P_scaled = scale_product_matrix(P, mode=strategy)
@@ -325,6 +354,7 @@ def isolation_pipeline(
 
     return {
         "ActivationMatrix": A,               # LED×Opsin (all)
+        "isolation_possible": True,
         "InverseActivationMatrix": invM,     # 3×3 (Opsins×LEDs)
         "ProductMatrix": P,                  # 3×3 LED×<opsin>_ISO (raw)
         "ScaledProductMatrix": P_scaled,     # 3×3 LED×<opsin>_ISO (scaled)
@@ -412,4 +442,3 @@ __all__ = [
     "compute_midgray_and_amplitude",
     "recommend_led_power_ratios",
 ]
-

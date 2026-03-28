@@ -181,7 +181,7 @@ def convert_to_photon_flux(normalized_df: pd.DataFrame, led_powers_watts: dict |
         if mask.sum() > 1:
             avg_E = np.trapezoid(E[mask] * spectrum[mask], wl[mask])
             if avg_E > 0:
-                spot_area = np.pi * (250 ** 2)  # µm²
+                spot_area = np.pi * (250 ** 2)  # µm² 
                 photons_total = P / avg_E
                 out[f"{led}_PhotonFlux"] = (photons_total / spot_area) * spectrum
                 continue
@@ -214,7 +214,7 @@ def save_all_outputs(
     powermeter_csv: Path | None = None,
 ) -> dict[str, pd.DataFrame]:
     """
-    Run the full pipeline and save each stage to CSV in `output_dir`.
+    Run the full pipeline and save each stage to CSV in `outputs`.
 
     Returns a dict of DataFrames:
         {

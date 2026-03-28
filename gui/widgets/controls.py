@@ -5,6 +5,7 @@ _LED_CONFIGS = {
     "RGB":  ["Red", "Green", "Blue"],
     "RGUV": ["Red", "Green", "UV"],
     "GBUV": ["Green", "Blue", "UV"],
+    "OLED": ["White"],
 }
 
 
@@ -22,7 +23,7 @@ class Controls(QtWidgets.QWidget):
         # --- Scope selection ---
         v.addWidget(QtWidgets.QLabel("Scope"))
         self.scope_combo = QtWidgets.QComboBox()
-        self.scope_combo.addItems(["Hyperscope", "MP2000"])
+        self.scope_combo.addItems(["Hyperscope", "MP2000", "Rig1", "AOSLO"])
         v.addWidget(self.scope_combo)
 
         # --- Species ---
@@ -31,8 +32,14 @@ class Controls(QtWidgets.QWidget):
         self.species_combo.addItems(species_list)
         v.addWidget(self.species_combo)
 
+        # --- Experiment type ---
+        v.addWidget(QtWidgets.QLabel("Experiment type"))
+        self.experiment_combo = QtWidgets.QComboBox()
+        self.experiment_combo.addItems(["Ex vivo", "In vivo foveal", "In vivo non-foveal"])
+        v.addWidget(self.experiment_combo)
+
         # --- LED configuration (exactly 3 at a time) ---
-        v.addWidget(QtWidgets.QLabel("LED configuration (3 LEDs)"))
+        v.addWidget(QtWidgets.QLabel("LED configuration"))
         self.led_combo = QtWidgets.QComboBox()
         self.led_combo.addItems(led_configs)
         v.addWidget(self.led_combo)
@@ -40,7 +47,7 @@ class Controls(QtWidgets.QWidget):
         # --- Neutral Density (optical density) ---
         v.addWidget(QtWidgets.QLabel("Neutral Density (OD)"))
         self.nd_combo = QtWidgets.QComboBox()
-        self.nd_combo.addItems(["0", "0.25", "1", "2", "3"])
+        self.nd_combo.addItems(["0", "0.25", "0.6", "1", "2", "3"])
         self.nd_combo.setToolTip("Optical density; transmission = 10^(-OD)")
         v.addWidget(self.nd_combo)
 
@@ -61,7 +68,7 @@ class Controls(QtWidgets.QWidget):
         # === LED power calibration (date ranges) ===
         v.addWidget(QtWidgets.QLabel("LED power calibration"))
         self.power_combo = QtWidgets.QComboBox()
-        self.power_combo.setToolTip("Sets R/G/B/UV power (nW) for a 250 µm spot")
+        self.power_combo.setToolTip("Sets R/G/B/UV power (nW) for a 250 µm spot (FF for OLED)")
         v.addWidget(self.power_combo)
 
         # --- Recommend LED ratio button ---
@@ -80,8 +87,9 @@ class Controls(QtWidgets.QWidget):
         v.addStretch(1)
 
         # --- Events (hook all relevant widgets to one emitter) ---
-        self.scope_combo.currentIndexChanged.connect(self._emit_params_changed)
+        #self.scope_combo.currentIndexChanged.connect(self._emit_params_changed)
         self.species_combo.currentIndexChanged.connect(self._emit_params_changed)
+        self.experiment_combo.currentIndexChanged.connect(self._emit_params_changed)
         self.led_combo.currentIndexChanged.connect(self._emit_params_changed)
         self.nd_combo.currentIndexChanged.connect(self._emit_params_changed)
         self.equalize_chk.stateChanged.connect(self._emit_params_changed)
@@ -125,3 +133,7 @@ class Controls(QtWidgets.QWidget):
 
     def current_power_key(self) -> str:
         return self.power_combo.currentText()
+
+    def current_experiment_type(self) -> str:
+        """Return 'Ex vivo', 'In vivo foveal', or 'In vivo non-foveal'."""
+        return self.experiment_combo.currentText()

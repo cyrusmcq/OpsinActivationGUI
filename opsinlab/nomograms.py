@@ -27,6 +27,12 @@ species_data: Dict[str, Dict[str, float]] = {
         "MW": 529,
         "SW": 430,
     },
+    "Human": {
+        "Rh": 503,
+        "LW": 561,
+        "MW": 536,
+        "SW": 430,
+    },
     "Macaque": {
         "Rh": 503,
         "LW": 561,

@@ -1,5 +1,7 @@
 from PyQt6 import QtWidgets, QtCore
 from opsinlab.io_led import process_led_data
+from opsinlab.io_oled import process_oled_data
+from opsinlab.io_AOSLO import process_aoslo_data
 from opsinlab.nomograms import generate_nomograms, available_species, interpolate_nomograms
 from opsinlab.activation import isolation_pipeline, compute_midgray_and_amplitude, recommend_led_power_ratios
 from gui.widgets.controls import Controls
@@ -27,7 +29,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # left controls, right plots
         self.controls = Controls(
             species_list=available_species(),
-            led_configs=["RGB", "RGUV", "GBUV"],
+            led_configs=["RGB", "RGUV", "GBUV", "OLED"],
         )
 
         self.plots = Plots()
@@ -43,10 +45,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.controls.power_combo.addItems(list(self._POWER_SETS_NW.keys()))
 
         def _powers_watts_from_key(key: str) -> dict:
-            # Fallback-friendly: if control not present or key missing, use Current
+            # Fallback-friendly: if control not present or key missing, use first available
             if not key:
-                key = "Current"
-            sel = self._POWER_SETS_NW.get(key, self._POWER_SETS_NW["Current"])
+                key = next(iter(self._POWER_SETS_NW))
+            first_key = next(iter(self._POWER_SETS_NW))
+            sel = self._POWER_SETS_NW.get(key, self._POWER_SETS_NW[first_key])
             return {k: v * 1e-9 for k, v in sel.items()}  # nW -> W
 
         self._powers_watts_from_key = _powers_watts_from_key
@@ -55,11 +58,9 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             power_key = self.controls.current_power_key()
         except Exception:
-            power_key = "Current"
+            power_key = next(iter(self._POWER_SETS_NW))
 
-        self._photon_flux_base = process_led_data(
-            led_powers_watts=self._powers_watts_from_key(power_key)
-        )
+        self._photon_flux_base = self._compute_photon_flux(power_key)
         self._photon_flux = self._photon_flux_base.copy()  # working (attenuated) copy
 
         # last outputs cache for saving
@@ -109,6 +110,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
         if scope_name == "Hyperscope":
             filename = "Hyperscope_LED_power.csv"
+        elif scope_name == "Rig1":
+            filename = "Rig1_OLED_power.csv"
+        elif scope_name == "AOSLO":
+            filename = "AOSLO_power.csv"
         else:
             filename = "MP2000_LED_power.csv"
 
@@ -157,24 +162,101 @@ class MainWindow(QtWidgets.QMainWindow):
 
         return power_sets
 
+    def _compute_photon_flux(self, power_key: str):
+        scope = self.controls.scope_combo.currentText()
+        led_config = self.controls.led_combo.currentText()
+        if scope == "AOSLO":
+            powers = self._powers_watts_from_key(power_key)
+            return process_aoslo_data(led_powers_watts=powers)
+        elif led_config == "OLED":
+            return process_oled_data(power_row=power_key)
+        else:
+            return process_led_data(
+                led_powers_watts=self._powers_watts_from_key(power_key)
+            )
 
     def _scope_changed(self, *_):
-        """Handle changes in scope (Hyperscope vs MP2000)."""
         scope = self.controls.current_scope()
+
+        # Block signals to prevent premature recompute from LED config change
+        self.controls.led_combo.blockSignals(True)
+        if scope == "Rig1":
+            self.controls.led_combo.setCurrentText("OLED")
+        elif scope == "AOSLO":
+            self.controls.led_combo.setCurrentText("RGB")
+        elif self.controls.led_combo.currentText() == "OLED":
+            # Leaving Rig1 with OLED still selected — fall back to RGB
+            self.controls.led_combo.setCurrentText("RGB")
+        self.controls.led_combo.blockSignals(False)
+
         try:
             self._POWER_SETS_NW = self._load_power_csv(scope)
         except Exception as e:
             QtWidgets.QMessageBox.warning(self, "Failed to load power sets", str(e))
             return
 
-        # Update the calibration dropdown without causing extra recomputes
         self.controls.power_combo.blockSignals(True)
         self.controls.power_combo.clear()
         self.controls.power_combo.addItems(list(self._POWER_SETS_NW.keys()))
         self.controls.power_combo.blockSignals(False)
 
-        # Recompute with the new calibration
         self.recompute()
+
+    def _apply_preretinal_filtering(
+        self,
+        experiment_type: str,
+        nomogram_df: pd.DataFrame,
+    ) -> pd.DataFrame:
+        """
+        Apply pre-retinal filtering (lens and macular pigment) to nomograms
+        for in vivo experiments, using optical density data from cvrl.org.
+
+        - 10 degrees: lens absorption only
+        - 2 degrees:  lens + macular pigment (foveal)
+
+        The filtering follows the standard formulation:
+          sensitivity_in_vivo(λ) = sensitivity_ex_vivo(λ) / 10^(OD_total(λ))
+
+        Parameters
+        ----------
+        experiment_type : str
+            'In vivo foveal' or 'In vivo non-foveal'
+        nomogram_df : pd.DataFrame
+            Area-normalized nomograms with 'Wavelength' column.
+
+        Returns
+        -------
+        pd.DataFrame
+            Filtered nomograms (all opsin columns attenuated).
+        """
+        project_root = os.path.dirname(os.path.dirname(__file__))
+        assets_dir = os.path.join(project_root, "assets")
+        wl = nomogram_df["Wavelength"].values
+
+        # Load lens optical density (headerless CSV: wavelength, OD)
+        lens_df = pd.read_csv(os.path.join(assets_dir, "lens_trans.csv"), header=None)
+        lens_od = np.interp(wl, lens_df.iloc[:, 0].values, lens_df.iloc[:, 1].values,
+                            left=lens_df.iloc[0, 1], right=0.0)
+
+        total_od = lens_od.copy()
+
+        # Add macular pigment for 2-degree (foveal) case
+        if experiment_type == "In vivo foveal":
+            mac_df = pd.read_csv(os.path.join(assets_dir, "mac_pig.csv"), header=None)
+            mac_od = np.interp(wl, mac_df.iloc[:, 0].values, mac_df.iloc[:, 1].values,
+                               left=mac_df.iloc[0, 1], right=0.0)
+            total_od = total_od + mac_od
+
+        # Transmittance = 10^(-OD)
+        transmittance = 10.0 ** (-total_od)
+
+        # Apply to all opsin columns
+        out = nomogram_df.copy()
+        for col in out.columns:
+            if col != "Wavelength":
+                out[col] = out[col] * transmittance
+
+        return out
 
     @staticmethod
     def _format_iso_summary(iso_rates: dict) -> str:
@@ -203,11 +285,13 @@ class MainWindow(QtWidgets.QMainWindow):
             try:
                 power_key = self.controls.current_power_key()
             except Exception:
-                power_key = "Current"
+                power_key = next(iter(self._POWER_SETS_NW))
 
-            self._photon_flux_base = process_led_data(
-                led_powers_watts=self._powers_watts_from_key(power_key)
-            )
+            # Ensure the key exists in the current scope's power sets
+            if power_key not in self._POWER_SETS_NW:
+                power_key = next(iter(self._POWER_SETS_NW))
+
+            self._photon_flux_base = self._compute_photon_flux(power_key)
 
             # --- ND + PMT attenuation ---
             try:
@@ -230,9 +314,20 @@ class MainWindow(QtWidgets.QMainWindow):
             # Apply attenuation to a pristine copy
             pf = self._photon_flux_base.copy()
             for col in pf.columns:
-                if col.endswith("_PhotonFlux") or col in ("Red", "Green", "Blue", "UV"):
+                if col.endswith("_PhotonFlux") or col in ("Red", "Green", "Blue", "UV", "White"):
                     pf[col] = pf[col] * transmission
             self._photon_flux = pf
+
+            # Filter out LEDs with zero photon flux (e.g., AOSLO channels set to 0 nW)
+            active_leds = []
+            for led in leds:
+                for col in pf.columns:
+                    if col == led or col == f"{led}_PhotonFlux":
+                        if pf[col].abs().sum() > 0:
+                            active_leds.append(led)
+                        break
+            if active_leds:
+                leds = active_leds
 
             # LED grid (e.g., 300–700 from your photon-flux table)
             wl_led = pf["Wavelength"].to_numpy(dtype=float)
@@ -248,8 +343,18 @@ class MainWindow(QtWidgets.QMainWindow):
             if hasattr(self.plots, "update_nomogram_plot"):
                 self.plots.update_nomogram_plot(nomo_200_700)
 
-            # Interpolate back to the LED grid for all math (alignment guaranteed)
-            nomo = interpolate_nomograms(nomo_200_700, wl_led)
+            # --- Choose opsin sensitivities based on experiment type ---
+            experiment_type = self.controls.current_experiment_type()
+
+            # Always interpolate standard nomograms to the LED grid
+            nomo_led_grid = interpolate_nomograms(nomo_200_700, wl_led)
+
+            if experiment_type in ("In vivo foveal", "In vivo non-foveal"):
+                # Apply lens (+ macular pigment for 2°) filtering to all opsins
+                nomo = self._apply_preretinal_filtering(experiment_type, nomo_led_grid)
+            else:
+                # Ex vivo: use bare opsin nomograms as-is
+                nomo = nomo_led_grid
 
             # Isolation settings
             strategy = "match_across_isolations" if self.controls.match_across_isolations() else "per_isolation_max"
@@ -295,15 +400,19 @@ class MainWindow(QtWidgets.QMainWindow):
 
             # update plots once
             A = out["ActivationMatrix"]
-            mods = out["Modulations"]
+            isolation_ok = out.get("isolation_possible", True)
+            mods = out["Modulations"]  # None when isolation not possible
 
-            # --- mid-gray + amplitude ---
-            try:
-                mid = compute_midgray_and_amplitude(mods)
-                gamma_global = float(mid["gamma_max"].min()) if not mid.empty else None
-            except Exception:
-                mid = None
-                gamma_global = None
+            # --- mid-gray + amplitude (isolation only) ---
+            mid = None
+            gamma_global = None
+            if isolation_ok and mods is not None:
+                try:
+                    mid = compute_midgray_and_amplitude(mods)
+                    gamma_global = float(mid["gamma_max"].min()) if not mid.empty else None
+                except Exception:
+                    mid = None
+                    gamma_global = None
 
             self.plots.update_all(
                 photon_flux_df=pf,
@@ -316,7 +425,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
             # --- Build isolating LED vectors for the Summary tab ---
             iso_vectors = {}
-            if mods is not None and not mods.empty:
+            if isolation_ok and mods is not None and not mods.empty:
                 leds_all = list(mods.index)
                 leds3 = [L for L in leds if L in leds_all] or leds_all
                 code = _led_set_code(leds3)  # e.g. "RGB", "RGUV", "GBUV"
@@ -361,9 +470,17 @@ class MainWindow(QtWidgets.QMainWindow):
         # keep your existing _save_matrices body here
 
     def _recommend_led_ratios(self):
-        # (unchanged – your existing implementation)
+        # Guard: power ratio recommendation requires 3+ independent LEDs
+        if self._last_out and not self._last_out.get("isolation_possible", True):
+            QtWidgets.QMessageBox.information(
+                self,
+                "Not available",
+                "LED power ratio recommendation requires ≥ 3 independent LED channels.\n"
+                "This feature is not available for single-channel sources (e.g. OLED).",
+            )
+            return
+        # (unchanged – your existing implementation below)
         ...
-        # keep your existing _recommend_led_ratios body here
 
 
 def main():

@@ -7,8 +7,8 @@ from matplotlib.colorbar import ColorbarBase
 from matplotlib import cm
 
 # ===== Color rules =====
-LED_COLORS = {"Red": "red", "Green": "green", "Blue": "blue", "UV": "purple"}
-LED_WAVELENGTHS = {"Red": 640, "Green": 550, "Blue": 465, "UV": 390}  # for ordering
+LED_COLORS = {"Red": "red", "Green": "green", "Blue": "blue", "UV": "purple", "White": "black"}
+LED_WAVELENGTHS = {"Red": 640, "Green": 550, "Blue": 465, "UV": 390, "White": 500}  # for ordering
 OPSIN_COLORS = {
     "LW": "red",
     "MW": "green",
@@ -37,6 +37,8 @@ def _led_set_code(leds_sorted):
         return "RGUV"
     if key == ("Green", "Blue", "UV"):
         return "GBUV"
+    if key == ("White",):
+        return "White"
     def init(L): return "U" if L == "UV" else L[0]
     return "".join(init(L) for L in leds_sorted)
 
@@ -324,7 +326,7 @@ class _IsolationTab(QtWidgets.QWidget):
 
 
     def set_modulations(self, mods_df, leds_in_use, activation_matrix):
-        """mods_df: DataFrame with rows=LEDs and columns '<opsin>_isolating'."""
+        """mods_df: DataFrame with rows=LEDs and columns '<opsin>_isolating', or None."""
         self._mods = mods_df
         self._leds_in_use = list(leds_in_use) if leds_in_use else None
         self._A = activation_matrix
@@ -340,8 +342,19 @@ class _IsolationTab(QtWidgets.QWidget):
     def _redraw(self):
         self.ax.clear()
         if self._mods is None or self._mods.empty or self.combo.count() == 0:
-            self.ax.text(0.5, 0.5, "No isolation vectors", ha="center", va="center")
+            # Distinguish single-channel (OLED) from other "no data" states
+            if self._leds_in_use and len(self._leds_in_use) < 3:
+                msg = (
+                    f"Opsin isolation requires ≥ 3 independent LED channels.\n"
+                    f"Current source: {', '.join(self._leds_in_use)}\n\n"
+                    f"R*/s values are still computed — see Summary and Photon Flux tabs."
+                )
+            else:
+                msg = "No isolation vectors"
+            self.ax.text(0.5, 0.5, msg, ha="center", va="center",
+                         fontsize=10, transform=self.ax.transAxes)
             self.vec_label.setText("")
+            self.contrast_label.setText("")
             self.canvas.draw_idle()
             return
 

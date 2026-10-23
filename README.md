@@ -55,6 +55,11 @@ OpsinActivation is a GUI-driven tool designed to model and visualize photorecept
    ```
    python app.py
    ```
+3.b **Alternatively: Run the application as a module**:
+
+   ```
+   python -m gui.app
+   ```
 
 ---
 
